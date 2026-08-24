@@ -1949,7 +1949,12 @@ function wireMemberEdit() {
   if (!m) { document.getElementById('backHomeBtn')?.addEventListener('click', () => go('home')); return; }
   const backTo = state.params.backTo || { view: 'list', params: { familyId: m.family_id } };
 
-  document.getElementById('backListBtn').addEventListener('click', () => goReplace(backTo.view, backTo.params));
+  // 返回列表 always means what it says — back to 家族成員列表 — regardless of
+  // which page linked into this edit form (tree, notes, admin, the list
+  // itself...). Chained father/mother/spouse/child links below still carry
+  // backTo through so those keep their own return context, and 家系圖/刪除
+  // keep their own separate destinations.
+  document.getElementById('backListBtn').addEventListener('click', () => goReplace('list', { familyId: m.family_id }));
   document.getElementById('treeBtn').addEventListener('click', () => go('tree', { familyId: m.family_id }));
   document.querySelectorAll('[data-goto-member]').forEach(a => a.addEventListener('click', (e) => {
     e.preventDefault();
