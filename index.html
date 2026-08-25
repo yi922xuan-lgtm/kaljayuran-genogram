@@ -929,22 +929,75 @@ function seedDB() {
 }
 
 let DB = null;
+// Set when loadDB() had to fall back to seed data because reading/parsing
+// the real stored database failed — surfaced to the user once the UI is up
+// (see the startup check in go()/render() bootstrap below) so a load
+// problem is never silently mistaken for "everything is fine, just empty".
+let dbLoadError = null;
 function loadDB() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      DB = JSON.parse(raw);
-      if (!DB.coupleNotes) DB.coupleNotes = {};
-      if (!DB.registrationRequests) DB.registrationRequests = [];
-      if (!DB.nextId.regReq) DB.nextId.regReq = 1;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed.families) || !Array.isArray(parsed.members)) {
+        throw new Error('資料格式不完整（缺少 families／members）');
+      }
+      if (!parsed.nextId) parsed.nextId = {};
+      if (!parsed.coupleNotes) parsed.coupleNotes = {};
+      if (!parsed.registrationRequests) parsed.registrationRequests = [];
+      if (!parsed.nextId.regReq) parsed.nextId.regReq = 1;
+      DB = parsed;
       return;
     }
-  } catch (e) { /* fall through to reseed */ }
+  } catch (e) {
+    // CRITICAL SAFETY NET: a load/parse problem must never be allowed to
+    // silently overwrite real stored data with fresh seed data. Earlier
+    // versions of this function called persist() immediately after
+    // reseeding here, which meant ANY transient read error (a corrupt
+    // write, a missing field from an older data shape, a storage-quota
+    // hiccup) would permanently destroy the user's real family data the
+    // instant the page loaded — before they even saw anything on screen.
+    // Now: stash whatever was actually in storage under a timestamped
+    // recovery key (untouched by anything else the app does), fall back to
+    // seed data IN MEMORY ONLY, and do NOT call persist() — so the original
+    // value in STORAGE_KEY itself is left completely alone. Recovery stays
+    // possible both from the stashed recovery key and, as long as the
+    // stored value itself was never overwritten, from STORAGE_KEY directly.
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) localStorage.setItem(STORAGE_KEY + '__recovery_' + Date.now(), raw);
+    } catch (e2) { /* best effort — if even this fails, keep going without it */ }
+    dbLoadError = (e && e.message) || String(e);
+    DB = seedDB();
+    return;
+  }
+  // Nothing stored yet at all (first-ever visit) — this is the normal,
+  // non-error first-run path, not a failure, so seed AND persist as before.
   DB = seedDB();
   persist();
 }
 function persist() {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(DB)); } catch (e) { toast('瀏覽器儲存空間已滿，部分變更可能無法保存', true); }
+}
+/** Recovery keys stashed by loadDB() above when it couldn't read the real
+ *  database (see the comment there). Surfaced in the 資料備份 admin tab so a
+ *  user can inspect / restore one without needing developer tools. */
+function listRecoveryBackups() {
+  const out = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.indexOf(STORAGE_KEY + '__recovery_') === 0) {
+      const ts = Number(k.slice((STORAGE_KEY + '__recovery_').length));
+      let summary = null;
+      try {
+        const d = JSON.parse(localStorage.getItem(k));
+        summary = { families: (d.families || []).length, members: (d.members || []).length };
+      } catch (e) { /* leave summary null — still offer it, just can't preview counts */ }
+      out.push({ key: k, ts, summary });
+    }
+  }
+  out.sort((a, b) => b.ts - a.ts);
+  return out;
 }
 /** Full-database backup file — the whole `DB` object (all families, members,
  *  spouses, notes, accounts, id counters) as one JSON file, so it can be
@@ -1181,7 +1234,30 @@ function viewIsAllowed() {
   }
   return PUBLIC_ENTRY_VIEWS.has(state.view);
 }
+/** Persistent, hard-to-miss banner (independent of the SPA's #app content,
+ *  so it survives every navigation) shown whenever loadDB() had to fall
+ *  back to seed data this session, or whenever an auto-saved recovery
+ *  backup is sitting unresolved from an earlier session — see loadDB() /
+ *  listRecoveryBackups() above. A 2.6s toast is easy to miss for something
+ *  this important; this stays up until the user resolves or dismisses it. */
+function renderDbAlertBanner() {
+  const existing = document.getElementById('dbAlertBanner');
+  if (!currentUser()) { if (existing) existing.remove(); return; }
+  const backups = listRecoveryBackups();
+  if (!dbLoadError && !backups.length) { if (existing) existing.remove(); return; }
+  const banner = existing || document.createElement('div');
+  banner.id = 'dbAlertBanner';
+  banner.innerHTML = `
+    <div style="background:#fdecea; color:#7a1f1f; border-bottom:2px solid #d9534f; padding:10px 16px; font-size:14px; line-height:1.7; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; position:sticky; top:0; z-index:999;">
+      <span>⚠️ ${dbLoadError ? '偵測到本機資料讀取失敗，目前顯示的是暫時的範本資料。' : ''}系統找到 ${backups.length} 份自動保存的復原備份，請盡快確認並還原。</span>
+      <button id="dbAlertGoBtn" style="background:#d9534f; color:#fff; border:none; border-radius:4px; padding:6px 14px; cursor:pointer; font-size:13px; flex:0 0 auto;">前往查看</button>
+    </div>`;
+  if (!existing) document.body.prepend(banner);
+  document.getElementById('dbAlertGoBtn').addEventListener('click', () => go('admin', { tab: 'backup' }));
+}
+
 function render() {
+  renderDbAlertBanner();
   const app = document.getElementById('app');
   if (!viewIsAllowed()) { state.view = 'landing'; state.params = {}; }
   switch (state.view) {
@@ -1590,6 +1666,23 @@ function viewAdmin() {
 
     <div class="panel${tab === 'backup' ? '' : ' hidden'}" id="backupTab">
       <h2 class="section-title">資料備份與還原</h2>
+      ${(() => {
+        const backups = listRecoveryBackups();
+        if (!backups.length) return '';
+        return `
+        <div style="margin-bottom:20px; padding:16px; border:2px solid #d9534f; border-radius:8px; background:#fff7f6;">
+          <h3 style="margin:0 0 8px; color:#a33;">⚠️ 偵測到自動保存的復原備份</h3>
+          <p class="small muted" style="line-height:1.7; margin:0 0 4px;">系統在讀取本機資料發生問題、暫時改用範本資料顯示時，會自動把當下讀不到的原始資料另外保存一份，避免被覆蓋掉。以下是目前偵測到的備份，建議先「還原」把資料復原回來，確認內容沒問題後再考慮「捨棄」。</p>
+          ${backups.map(b => `
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 0; border-top:1px solid #f0d0ce; flex-wrap:wrap;">
+              <div class="small">保存時間：${new Date(b.ts).toLocaleString('zh-TW')}　${b.summary ? `（${b.summary.families} 個家族、${b.summary.members} 位成員）` : '（內容無法預覽，格式可能已損毀）'}</div>
+              <div class="btn-row" style="flex:0;">
+                <button class="btn sm primary" data-restore-recovery="${b.key}">還原這份</button>
+                <button class="btn sm" data-discard-recovery="${b.key}">捨棄</button>
+              </div>
+            </div>`).join('')}
+        </div>`;
+      })()}
       <p class="small muted" style="max-width:640px; line-height:1.8;">
         這個預覽版的資料是儲存在「目前這一台裝置、這一個瀏覽器」裡，並沒有雲端伺服器──所以在電腦上輸入、儲存好的資料，換一支手機或另一個瀏覽器開啟同一個網址時，是看不到的，這是本系統目前的運作方式，不是資料遺失或損毀，電腦上原本的資料仍然完整保留、不受影響。<br><br>
         若要在其他裝置（例如手機）上看到同一份資料，請照以下步驟：<br>
@@ -1699,6 +1792,31 @@ function wireAdmin() {
     };
     reader.readAsText(file);
   });
+
+  // Auto-saved recovery backups from a failed local read (see loadDB() /
+  // listRecoveryBackups() in 02-app.js). Only present when something went
+  // wrong loading the real data — most sessions will have none of these.
+  document.querySelectorAll('[data-restore-recovery]').forEach(btn => btn.addEventListener('click', () => {
+    const key = btn.dataset.restoreRecovery;
+    const raw = localStorage.getItem(key);
+    if (!raw) { toast('這份備份已經不存在了', true); render(); return; }
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (err) { toast('這份備份的內容已損毀，無法還原', true); return; }
+    if (!Array.isArray(parsed.families) || !Array.isArray(parsed.members)) { toast('這份備份的內容不完整，無法還原', true); return; }
+    if (!confirm(`確定要用這份自動保存的復原備份（${parsed.families.length} 個家族、${parsed.members.length} 位成員）覆蓋目前的資料嗎？此操作無法復原。`)) return;
+    restoreDB(parsed);
+    dbLoadError = null;
+    toast('已還原復原備份');
+    state.params = { tab: 'fam' };
+    render();
+  }));
+  document.querySelectorAll('[data-discard-recovery]').forEach(btn => btn.addEventListener('click', () => {
+    const key = btn.dataset.discardRecovery;
+    if (!confirm('確定要捨棄這份復原備份嗎？捨棄後將無法再還原。')) return;
+    localStorage.removeItem(key);
+    toast('已捨棄這份備份');
+    render();
+  }));
 }
 
 function renderFamList() {
