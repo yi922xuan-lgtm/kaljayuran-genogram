@@ -2551,121 +2551,140 @@ function buildUnits(members) {
 
 function buildTreeLayout(members) {
   const units = buildUnits(members);
-  const colOf = new Map(); const visited = new Set(); let colCursor = 0;
-  function assignColumns(unitId) {
-    if (colOf.has(unitId)) return colOf.get(unitId);
-    visited.add(unitId);
-    const unit = units[unitId];
-    const childCols = [];
-    for (const cid of unit.childUnitIds) {
-      if (visited.has(cid) && !colOf.has(cid)) continue;
-      childCols.push(assignColumns(cid));
-    }
-    let col;
-    if (childCols.length) col = (Math.min(...childCols) + Math.max(...childCols)) / 2;
-    else { col = colCursor; colCursor += 1; }
-    colOf.set(unitId, col);
-    return col;
-  }
-  const roots = units.filter(u => u.generation === 1);
-  const rootIds = roots.length ? roots.map(u => u.id) : (units[0] ? [units[0].id] : []);
-  for (const rid of rootIds) assignColumns(rid);
-  for (const u of units) if (!colOf.has(u.id)) assignColumns(u.id);
-
-  // Immediate parent unit of each unit (the couple whose childUnitIds this
-  // unit appears in) — used below to tell "true full siblings" (same parent
-  // couple) apart from unrelated adjacent branches, so siblings can pack
-  // tighter than the gap between separate families.
-  const parentOf = new Map();
-  for (const u of units) for (const cid of u.childUnitIds) parentOf.set(cid, u.id);
-  // Only a unit with its own integer lane (a leaf-like branch — see the
-  // colCursor assignment above) owns a lane outright; this maps lane index
-  // back to that unit so adjacent-lane gaps can compare their parents.
-  const unitOfLane = new Map();
-  for (const u of units) { const c = colOf.get(u.id); if (Number.isInteger(c)) unitOfLane.set(c, u.id); }
-  function gapBetweenLanes(lo, hi) {
-    const a = unitOfLane.get(lo), b = unitOfLane.get(hi);
-    if (a === undefined || b === undefined) return COL_GAP;
-    const pa = parentOf.get(a), pb = parentOf.get(b);
-    return (pa !== undefined && pa === pb) ? COL_GAP_SIBLING : COL_GAP;
-  }
-
-  const soloUnitWidth = FRAME_PAD * 2 + NODE_W;
   const unitWidthOf = (u) => FRAME_PAD * 2 + NODE_W * u.members.length + COL_GAP_INNER * Math.max(0, u.members.length - 1);
 
-  // Columns used to all share one uniform width sized to fit the single
-  // widest frame anywhere in the tree — so one remarried anchor (a 3+ box
-  // frame) anywhere in a large family bloated every column everywhere else,
-  // even branches nowhere near it, producing huge dead whitespace. Instead,
-  // each integer "lane" (colCursor slot) gets only as much width as the
-  // widest frame that actually lands on it, so a wide frame only pushes its
-  // own lane's neighbors apart. A lane that only ever holds solo (unmarried)
-  // members must stay at soloUnitWidth, not get padded up to fit a couple
-  // that was never assigned there — on a large, lopsided family tree (a
-  // handful of very bushy branches next to many single-child ones) that
-  // padding alone was nearly doubling the width of most lanes. Room for a
-  // couple/remarried *ancestor* that lands between two lanes (a fractional
-  // column) is guaranteed separately below, only where one actually exists.
-  const laneWidth = new Map();
-  for (const u of units) {
-    const col = colOf.get(u.id);
-    if (Number.isInteger(col)) {
-      laneWidth.set(col, Math.max(laneWidth.get(col) || 0, unitWidthOf(u)));
+  // ------------------------------------------------------- tidy-tree packing
+  // Every unit is positioned bottom-up. A childless unit is just its own
+  // frame. A unit with children lays out each child's WHOLE subtree first
+  // (recursively — so a bushy branch is already fully packed before it's
+  // ever compared to its neighbors), then places those subtrees left to
+  // right as tightly as their actual rendered content allows: each next
+  // subtree slides left until its own content would touch the ones already
+  // placed, checked at every generation the two subtrees share (not just
+  // their own row), stopping COL_GAP_SIBLING short — every child of the
+  // same unit is a true full sibling of every other child, by definition.
+  // The parent is then centered over its own first/last child and its own
+  // frame is folded into the shared contour at its own generation, so if
+  // the parent's frame needs more room than its children happen to leave
+  // between them, that need surfaces automatically the next time this
+  // whole subtree is packed next to a neighboring one — without touching
+  // any width or gap *inside* this subtree.
+  //
+  // This replaces indexing every unit into one shared column lane (which
+  // only counted how many leaves came before it, not how much horizontal
+  // room they actually used): a compact, childless sibling used to sit
+  // exactly one lane-width from a sibling with a large family of their own,
+  // even though a lane-based "column" doesn't correspond to a fixed pixel
+  // width once each lane is sized to its own widest occupant — so a sibling
+  // with many descendants (and thus many lanes under them) could end up
+  // rendered far from a sibling with none, despite both being direct
+  // children of the very same parents. Packing whole subtrees by their
+  // actual left/right edges (a contour), generation by generation, keeps
+  // every full-sibling pair exactly COL_GAP_SIBLING apart regardless of how
+  // wide either one's own descendants turn out to be.
+  const posX = new Map();
+  const visited = new Set();
+  function layoutSubtree(unitId) {
+    if (visited.has(unitId)) return null; // cycle guard against malformed data
+    visited.add(unitId);
+    const u = units[unitId];
+    const ids = [unitId];
+    let L, R, ownX;
+    const kids = u.childUnitIds.map(layoutSubtree).filter(Boolean);
+    if (!kids.length) {
+      ownX = 0;
+      L = new Map(); R = new Map();
+    } else {
+      let mergedL = null, mergedR = null;
+      let firstX = null, lastX = null;
+      const childGen = units[u.childUnitIds[0]].generation;
+      for (const child of kids) {
+        let shift = 0;
+        if (mergedR) {
+          // Only the row these children themselves sit on (childGen) gets the
+          // tight sibling gap — they share this exact parent, so they ARE
+          // true full siblings there. Any deeper row where two different
+          // children's own descendants might collide (their grandkids, etc.)
+          // is a more distant relationship (first cousins or further), so it
+          // keeps the normal wide gap — otherwise two cousins whose parents
+          // happen to be siblings would get pulled in as tight as if they
+          // were siblings themselves.
+          for (const [gen, rx] of mergedR) {
+            if (!child.L.has(gen)) continue;
+            const gap = gen === childGen ? COL_GAP_SIBLING : COL_GAP;
+            const need = rx + gap - child.L.get(gen);
+            if (need > shift) shift = need;
+          }
+        }
+        if (shift) {
+          for (const id of child.ids) posX.set(id, posX.get(id) + shift);
+          for (const [gen, x] of child.L) child.L.set(gen, x + shift);
+          for (const [gen, x] of child.R) child.R.set(gen, x + shift);
+          child.ownX += shift;
+        }
+        if (!mergedL) { mergedL = new Map(child.L); mergedR = new Map(child.R); }
+        else {
+          for (const [gen, x] of child.L) if (!mergedL.has(gen) || x < mergedL.get(gen)) mergedL.set(gen, x);
+          for (const [gen, x] of child.R) if (!mergedR.has(gen) || x > mergedR.get(gen)) mergedR.set(gen, x);
+        }
+        ids.push(...child.ids);
+        if (firstX === null) firstX = child.ownX;
+        lastX = child.ownX;
+      }
+      ownX = (firstX + lastX) / 2;
+      L = mergedL; R = mergedR;
     }
+    posX.set(unitId, ownX);
+    const halfW = unitWidthOf(u) / 2;
+    const myL = ownX - halfW, myR = ownX + halfW;
+    if (!L.has(u.generation) || myL < L.get(u.generation)) L.set(u.generation, myL);
+    if (!R.has(u.generation) || myR > R.get(u.generation)) R.set(u.generation, myR);
+    return { ids, ownX, L, R };
   }
-  const maxLane = colCursor > 0 ? colCursor - 1 : 0;
-  for (let i = 0; i <= maxLane; i++) if (!laneWidth.has(i)) laneWidth.set(i, soloUnitWidth);
-  // An ancestor unit centered between two lanes (its column is the average
-  // of its children's, e.g. 2.5) doesn't own a lane outright — widen its two
-  // neighboring lanes if needed so its own frame still has room to fit
-  // between them without overlapping either one.
-  for (const u of units) {
-    const col = colOf.get(u.id);
-    if (Number.isInteger(col)) continue;
-    const lo = Math.floor(col), hi = Math.ceil(col);
-    const need = unitWidthOf(u);
-    const gap = gapBetweenLanes(lo, hi);
-    const available = (laneWidth.get(lo) + gap + laneWidth.get(hi)) / 2;
-    if (need > available) {
-      const extra = (need - available) / 2 + 4;
-      laneWidth.set(lo, laneWidth.get(lo) + extra);
-      laneWidth.set(hi, laneWidth.get(hi) + extra);
+  // The top-level forest: units no one else claims as a child (family roots,
+  // plus any orphaned branch so nothing silently vanishes). These are NOT
+  // siblings of each other, so they pack at the wider COL_GAP instead.
+  const childOf = new Set();
+  for (const u of units) for (const cid of u.childUnitIds) childOf.add(cid);
+  const topLevel = units.filter(u => !childOf.has(u.id));
+  let forestR = null;
+  let rightEdge = MARGIN;
+  for (const u of topLevel) {
+    const sub = layoutSubtree(u.id);
+    if (!sub) continue;
+    let shift = 0;
+    if (forestR) {
+      for (const [gen, rx] of forestR) {
+        if (!sub.L.has(gen)) continue;
+        const need = rx + COL_GAP - sub.L.get(gen);
+        if (need > shift) shift = need;
+      }
     }
+    if (shift) {
+      for (const id of sub.ids) posX.set(id, posX.get(id) + shift);
+      for (const [gen, x] of sub.R) sub.R.set(gen, x + shift);
+    }
+    if (!forestR) forestR = new Map(sub.R);
+    else for (const [gen, x] of sub.R) if (!forestR.has(gen) || x > forestR.get(gen)) forestR.set(gen, x);
+    for (const x of forestR.values()) if (x > rightEdge) rightEdge = x;
   }
-  // Cumulative center-x per lane. Adjacent lanes belonging to the same
-  // parent couple (true full siblings) pack at the tighter COL_GAP_SIBLING;
-  // every other adjacency (a different family branch) keeps the wider
-  // COL_GAP — this is what visually clusters each nuclear family together
-  // instead of spacing every leaf evenly regardless of who's related to whom.
-  const laneCenterX = new Map();
-  let cursorX = MARGIN;
-  let lastGap = COL_GAP;
-  for (let i = 0; i <= maxLane; i++) {
-    const w = laneWidth.get(i);
-    laneCenterX.set(i, cursorX + w / 2);
-    lastGap = i < maxLane ? gapBetweenLanes(i, i + 1) : COL_GAP;
-    cursorX += w + lastGap;
+  // The contour math above starts everything from a local zero origin —
+  // shift the whole forest so its leftmost content sits at MARGIN.
+  let minLeft = Infinity;
+  for (const u of units) {
+    const l = posX.get(u.id) - unitWidthOf(u) / 2;
+    if (l < minLeft) minLeft = l;
   }
-  const rightEdge = maxLane >= 0 && laneCenterX.size ? cursorX - lastGap : MARGIN;
-  // A unit's own column can be fractional (an ancestor centered between two
-  // lanes) — interpolate linearly between its two neighboring lane centers,
-  // matching how the original uniform-width layout always placed a unit at
-  // `col * colWidth` regardless of whether col was a whole number.
-  function xForCol(col) {
-    const lo = Math.floor(col), hi = Math.ceil(col);
-    if (lo === hi) return laneCenterX.get(lo);
-    const t = col - lo;
-    return laneCenterX.get(lo) + (laneCenterX.get(hi) - laneCenterX.get(lo)) * t;
-  }
+  const globalShift = MARGIN - (Number.isFinite(minLeft) ? minLeft : 0);
+  if (globalShift) { for (const u of units) posX.set(u.id, posX.get(u.id) + globalShift); rightEdge += globalShift; }
 
   const nodes = []; const frames = []; const unitGeom = new Map();
   for (const unit of units) {
-    const col = colOf.get(unit.id);
     const y = MARGIN + (unit.generation - 1) * ROW_H;
     const n = unit.members.length;
     const isCouple = n >= 2;
     const unitWidth = unitWidthOf(unit);
-    const unitLeft = xForCol(col) - unitWidth / 2;
+    const unitLeft = posX.get(unit.id) - unitWidth / 2;
     const boxCenterX = idx => unitLeft + FRAME_PAD + idx * (NODE_W + COL_GAP_INNER) + NODE_W / 2;
     unit.members.forEach((mem, idx) => {
       const x = unitLeft + FRAME_PAD + idx * (NODE_W + COL_GAP_INNER);
@@ -2891,17 +2910,18 @@ function unitFrameSVG(f) {
  *  tick at the line's midpoint. */
 function marriageConnectorSVG(f, pair) {
   const aX = f.boxCenterX(pair.aIdx), bX = f.boxCenterX(pair.bIdx);
-  const color = pair.isDivorced ? '#b5473a' : '#a8895c';
-  const dash = pair.isDivorced ? ' stroke-dasharray="7,5"' : '';
+  // The connector line itself is always solid black now, married or
+  // divorced alike — divorce is still signalled, just by the "×" tick below
+  // rather than by dashing or a different line color.
   const adjacent = Math.abs(pair.aIdx - pair.bIdx) === 1;
   let line, tickX, tickY;
   if (adjacent) {
     const x = (aX + bX) / 2, y1 = f.y + 26, y2 = f.y + f.height - 16;
-    line = `<line x1="${x}" y1="${y1}" x2="${x}" y2="${y2}" stroke="${color}" stroke-width="2"${dash}/>`;
+    line = `<line x1="${x}" y1="${y1}" x2="${x}" y2="${y2}" stroke="#000000" stroke-width="2"/>`;
     tickX = x; tickY = (y1 + y2) / 2;
   } else {
     const fb = f.y + f.height, routeY = fb + pair.routeOffset;
-    line = `<path d="M ${aX} ${fb} V ${routeY} H ${bX} V ${fb}" fill="none" stroke="${color}" stroke-width="2"${dash}/>`;
+    line = `<path d="M ${aX} ${fb} V ${routeY} H ${bX} V ${fb}" fill="none" stroke="#000000" stroke-width="2"/>`;
     tickX = (aX + bX) / 2; tickY = routeY;
   }
   const tick = pair.isDivorced
@@ -2951,9 +2971,9 @@ function renderTreeSVG() {
   treeState.members = members;
   const lines = [];
   for (const pe of layout.parentEdges) {
-    lines.push(`<line x1="${pe.down.x}" y1="${pe.down.y1}" x2="${pe.down.x}" y2="${pe.down.y2}" stroke="#8a7a5e" stroke-width="2.5"/>`);
-    lines.push(`<line x1="${pe.bus.x1}" y1="${pe.bus.y}" x2="${pe.bus.x2}" y2="${pe.bus.y}" stroke="#8a7a5e" stroke-width="2.5"/>`);
-    for (const c of pe.children) lines.push(`<line x1="${c.x}" y1="${c.y1}" x2="${c.x}" y2="${c.y2}" stroke="#8a7a5e" stroke-width="2.5"/>`);
+    lines.push(`<line x1="${pe.down.x}" y1="${pe.down.y1}" x2="${pe.down.x}" y2="${pe.down.y2}" stroke="#000000" stroke-width="2.5"/>`);
+    lines.push(`<line x1="${pe.bus.x1}" y1="${pe.bus.y}" x2="${pe.bus.x2}" y2="${pe.bus.y}" stroke="#000000" stroke-width="2.5"/>`);
+    for (const c of pe.children) lines.push(`<line x1="${c.x}" y1="${c.y1}" x2="${c.x}" y2="${c.y2}" stroke="#000000" stroke-width="2.5"/>`);
   }
   const svgStr = `<svg id="treeSvg" xmlns="http://www.w3.org/2000/svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}">
     <rect id="svgBgRect" x="0" y="0" width="${layout.width}" height="${layout.height}" fill="#ffffff"/>
@@ -3379,7 +3399,7 @@ function renderRelationSVG() {
   const familyId = relationState.familyId;
   const layout = buildRelationLayout(familyId);
   relationState.layout = layout;
-  const lines = layout.edges.map(e => `<line x1="${e.x1}" y1="${e.y1}" x2="${e.x2}" y2="${e.y2}" stroke="#8a7a5e" stroke-width="2.5"/>`).join('');
+  const lines = layout.edges.map(e => `<line x1="${e.x1}" y1="${e.y1}" x2="${e.x2}" y2="${e.y2}" stroke="#000000" stroke-width="2.5"/>`).join('');
   const svgStr = `<svg id="relationSvg" xmlns="http://www.w3.org/2000/svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}">
     <rect id="svgBgRect" x="0" y="0" width="${layout.width}" height="${layout.height}" fill="#ffffff"/>
     <g id="relEdgesLayer">${lines}</g>
