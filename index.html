@@ -2237,7 +2237,7 @@ function buildTreeLayout(members) {
   for (const rid of rootIds) assignColumns(rid);
   for (const u of units) if (!colOf.has(u.id)) assignColumns(u.id);
 
-  const coupleUnitWidth = FRAME_PAD * 2 + NODE_W * 2 + COL_GAP_INNER;
+  const soloUnitWidth = FRAME_PAD * 2 + NODE_W;
   const unitWidthOf = (u) => FRAME_PAD * 2 + NODE_W * u.members.length + COL_GAP_INNER * Math.max(0, u.members.length - 1);
 
   // Columns used to all share one uniform width sized to fit the single
@@ -2246,17 +2246,22 @@ function buildTreeLayout(members) {
   // even branches nowhere near it, producing huge dead whitespace. Instead,
   // each integer "lane" (colCursor slot) gets only as much width as the
   // widest frame that actually lands on it, so a wide frame only pushes its
-  // own lane's neighbors apart.
+  // own lane's neighbors apart. A lane that only ever holds solo (unmarried)
+  // members must stay at soloUnitWidth, not get padded up to fit a couple
+  // that was never assigned there — on a large, lopsided family tree (a
+  // handful of very bushy branches next to many single-child ones) that
+  // padding alone was nearly doubling the width of most lanes. Room for a
+  // couple/remarried *ancestor* that lands between two lanes (a fractional
+  // column) is guaranteed separately below, only where one actually exists.
   const laneWidth = new Map();
   for (const u of units) {
     const col = colOf.get(u.id);
     if (Number.isInteger(col)) {
-      const w = Math.max(coupleUnitWidth, unitWidthOf(u));
-      laneWidth.set(col, Math.max(laneWidth.get(col) || 0, w));
+      laneWidth.set(col, Math.max(laneWidth.get(col) || 0, unitWidthOf(u)));
     }
   }
   const maxLane = colCursor > 0 ? colCursor - 1 : 0;
-  for (let i = 0; i <= maxLane; i++) if (!laneWidth.has(i)) laneWidth.set(i, coupleUnitWidth);
+  for (let i = 0; i <= maxLane; i++) if (!laneWidth.has(i)) laneWidth.set(i, soloUnitWidth);
   // An ancestor unit centered between two lanes (its column is the average
   // of its children's, e.g. 2.5) doesn't own a lane outright — widen its two
   // neighboring lanes if needed so its own frame still has room to fit
