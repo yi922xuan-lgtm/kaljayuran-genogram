@@ -1344,6 +1344,28 @@ function requireAuth() {
   return true;
 }
 
+/** The family IDs a given user is the manager of (family.auth_manager_user_id
+ *  === user.id). A family gets a manager automatically the moment ANY
+ *  logged-in account creates it via 後台管理 → 家族管理 → ＋新增家族 (see
+ *  newFamBtn in 03-app-admin-member.js, which always stamps the creator as
+ *  auth_manager_user_id) — there's no separate "assign a manager" step. */
+function managedFamilyIds(user) {
+  if (!user) return [];
+  return DB.families.filter(f => f.auth_manager_user_id === user.id).map(f => f.id);
+}
+/** Whether `user` may reach admin-level (non-public) content/edit access for
+ *  `familyId`. admin/family_manager/test accounts can manage every family;
+ *  a 'member' account can only manage the specific family/families whose
+ *  auth_manager_user_id is their own — i.e. one they created themselves (or
+ *  one an admin later reassigns to them — nothing in this app currently
+ *  does that, but nothing stops it either). */
+function canManageFamily(user, familyId) {
+  if (!user) return false;
+  if (user.role !== 'member') return true;
+  const fid = Number(familyId);
+  return DB.families.some(f => f.id === fid && f.auth_manager_user_id === user.id);
+}
+
 /* ================================================================ RENDER */
 const PUBLIC_ENTRY_VIEWS = new Set(['landing', 'login', 'register', 'forgotpw', 'pfam', 'authcode']);
 /** Whether the current state.view is allowed to render as-is: an
@@ -1357,16 +1379,33 @@ const PUBLIC_ENTRY_VIEWS = new Set(['landing', 'login', 'register', 'forgotpw', 
  *  that was never actually opened up.
  *
  *  A 'member' account (self-registered, approved by an admin — see
- *  帳號申請) is NOT a backend user: they get exactly the same reach as an
- *  anonymous visitor — the public gallery and public/code-gated family
- *  pages — never 後台管理 or member-edit. The one difference is their own
- *  approved family's code-gated sections are already unlocked at login
- *  (state.verifiedFamilies), so they never have to re-enter that family's
- *  code. Only admin/family_manager/test accounts get the unconditional
- *  full-access `true` below. */
+ *  帳號申請) is NOT a global backend user — it never sees 後台管理's
+ *  帳號申請／忘記密碼／資料備份 tabs, and never sees any family it doesn't
+ *  manage. But for the specific family/families it DOES manage (see
+ *  managedFamilyIds() above — normally just the family it created itself
+ *  via ＋新增家族), it gets the same edit reach as admin/family_manager:
+ *  家族管理／成員維護 and the full (non-public) tree/relation/list/notes/
+ *  stats/query views, all scoped to that family by viewAdmin()/
+ *  renderFamList()/the memTab family selector filtering their options down
+ *  to only managed families — a member is never even shown that another
+ *  family exists, let alone able to open or edit it. Outside its own
+ *  managed families, a member gets exactly the same reach as an anonymous
+ *  visitor: the public gallery and public/code-gated family pages, with
+ *  its own approved family's code-gated sections already unlocked
+ *  (state.verifiedFamilies) so it never has to re-enter that code. */
 function viewIsAllowed() {
   const cu = currentUser();
   if (cu && cu.role !== 'member') return true;
+  if (cu && cu.role === 'member' && !(state.params && state.params.public)) {
+    if (state.view === 'admin' || state.view === 'home') return true;
+    if (['tree', 'relation', 'list', 'notes', 'stats', 'query'].includes(state.view)) {
+      return canManageFamily(cu, state.params && state.params.familyId);
+    }
+    if (state.view === 'member-edit') {
+      const m = memberById(state.params.id);
+      return !!m && canManageFamily(cu, m.family_id);
+    }
+  }
   if (state.params && state.params.public) {
     const key = state.view === 'pfam' ? 'pfamHome' : state.view;
     const vis = publicVisOf(state.params.familyId, key);
@@ -1680,9 +1719,11 @@ function viewLanding() {
   // 登出 rather than showing a login prompt to someone already logged in.
   // admin/family_manager/test accounts never linger on this view (login
   // sends them straight to 後台管理), so this branch is really only ever
-  // seen by a member.
+  // seen by a member. A member additionally gets a "管理我的家族" button —
+  // their doorway into 後台管理, scoped to only the family/families they
+  // manage (see canManageFamily()/managedFamilyIds() in viewIsAllowed).
   const authButtons = cu
-    ? `<span class="stat-chip" style="align-self:center;">已登入：${escapeHtml(cu.display_name)}</span><button class="btn" data-logout="1">登出</button>`
+    ? `<span class="stat-chip" style="align-self:center;">已登入：${escapeHtml(cu.display_name)}</span>${cu.role === 'member' ? '<button class="btn" id="toMyFamiliesBtn">管理我的家族</button>' : ''}<button class="btn" data-logout="1">登出</button>`
     : `<button class="btn" id="toLoginBtn">登入</button><button class="btn" id="toRegisterBtn">註冊帳號</button>`;
   return `
     <div class="topbar">
@@ -1720,6 +1761,8 @@ function wireLanding() {
   if (loginBtn) loginBtn.addEventListener('click', () => go('login'));
   const registerBtn = document.getElementById('toRegisterBtn');
   if (registerBtn) registerBtn.addEventListener('click', () => go('register'));
+  const myFamiliesBtn = document.getElementById('toMyFamiliesBtn');
+  if (myFamiliesBtn) myFamiliesBtn.addEventListener('click', () => go('admin', { tab: 'fam' }));
   document.querySelectorAll('[data-logout]').forEach(b => b.addEventListener('click', logout));
   document.querySelectorAll('[data-open]').forEach(card => card.addEventListener('click', () => goPublicSection('pfamHome', Number(card.dataset.open))));
 }
@@ -1875,9 +1918,14 @@ function wireRegister() {
 }
 
 /* -------------------------------------------------------------- HOME */
+/** The authenticated "home gallery" — for admin/family_manager/test this
+ *  lists every family in the system, as before. For a 'member' account it
+ *  is scoped down to only the families it manages (see managedFamilyIds()
+ *  above): a member never sees that any other family even exists here. */
 function viewHome() {
   const user = currentUser();
-  const families = DB.families;
+  const isMember = user.role === 'member';
+  const families = isMember ? DB.families.filter(f => f.auth_manager_user_id === user.id) : DB.families;
   return `
     <div class="topbar">
       <div>
@@ -1885,13 +1933,13 @@ function viewHome() {
         <p class="subtitle">${escapeHtml(ORG_NAME)} 建置維護</p>
         <div class="btn-row">
           <button class="btn active">首頁</button>
-          <button class="btn" id="toAdminBtn">後台管理</button>
+          <button class="btn" id="toAdminBtn">${isMember ? '管理我的家族' : '後台管理'}</button>
           <button class="btn" data-logout="1">登出</button>
         </div>
       </div>
       <div class="topbar-stats">
-        <span class="stat-chip">家族總數：<strong>${families.length}</strong></span>
-        <span class="stat-chip">顯示家族：<strong>${families.length}</strong></span>
+        <span class="stat-chip">${isMember ? '我管理的家族' : '家族總數'}：<strong>${families.length}</strong></span>
+        ${isMember ? '' : `<span class="stat-chip">顯示家族：<strong>${families.length}</strong></span>`}
       </div>
       <div class="meta">
         名稱：<strong>${escapeHtml(user.display_name)}</strong>　帳號類別：<strong>${roleLabel(user.role)}</strong><br>
@@ -1909,7 +1957,7 @@ function viewHome() {
             <div class="stat-line">男性：${s.maleAlive}人</div>
             <div class="stat-line">女性：${s.femaleAlive}人</div>
           </div>`;
-        }).join('') : '<p class="muted placeholder-chip">目前尚無家族資料，請至「後台管理」新增家族。</p>'}
+        }).join('') : `<p class="muted placeholder-chip">${isMember ? '你目前還沒有自己管理的家族，請按上方「管理我的家族」新增一個。' : '目前尚無家族資料，請至「後台管理」新增家族。'}</p>`}
       </div>
     </div>`;
 }
@@ -1922,21 +1970,36 @@ function wireHome() {
 /* (continued in 03-app-admin-member.js, 04-app-tree.js, 05-app-list-placeholder.js, 06-app-modals-init.js) */
 
 /* ================================================================ ADMIN */
+/** 族譜後台. admin/family_manager/test see every family and every tab, as
+ *  before. A 'member' account sees a scoped-down version: only 家族管理／
+ *  成員維護 (never 帳號申請／忘記密碼／資料備份 — those are global-site
+ *  operations, not something a member managing their own family should
+ *  reach), and within those two tabs, only the family/families they
+ *  themselves manage (auth_manager_user_id === their id — set
+ *  automatically the moment they create a family below). This mirrors
+ *  viewIsAllowed()'s gate, which already blocks a member from landing here
+ *  at all for anything outside that scope — the filtering here is what
+ *  keeps the CONTENT of an allowed view (this one) from ever mentioning a
+ *  family the member doesn't manage. */
 function viewAdmin() {
   const user = currentUser();
-  const tab = state.params.tab || 'fam';
-  const families = DB.families;
+  const isMember = user.role === 'member';
+  const allFamilies = DB.families;
+  const families = isMember ? allFamilies.filter(f => f.auth_manager_user_id === user.id) : allFamilies;
+  let tab = state.params.tab || 'fam';
+  if (isMember && !['fam', 'mem'].includes(tab)) tab = 'fam';
   const memFamilyId = state.params.familyId || (families[0] && families[0].id);
   return `
     <div class="topbar">
       <div>
-        <h1 class="display">族譜後台</h1>
+        <h1 class="display">${isMember ? '我的家族管理' : '族譜後台'}</h1>
         <div class="btn-row">
           <button class="btn${tab === 'fam' ? ' active' : ''}" data-tab="fam">家族管理</button>
           <button class="btn${tab === 'mem' ? ' active' : ''}" data-tab="mem">成員維護</button>
+          ${isMember ? '' : `
           <button class="btn${tab === 'reg' ? ' active' : ''}" data-tab="reg">帳號申請${DB.registrationRequests.filter(r => !r.handled).length ? `（${DB.registrationRequests.filter(r => !r.handled).length}）` : ''}</button>
           <button class="btn${tab === 'pw' ? ' active' : ''}" data-tab="pw">忘記密碼${DB.pwResetRequests.filter(r => !r.handled).length ? `（${DB.pwResetRequests.filter(r => !r.handled).length}）` : ''}</button>
-          <button class="btn${tab === 'backup' ? ' active' : ''}" data-tab="backup">資料備份</button>
+          <button class="btn${tab === 'backup' ? ' active' : ''}" data-tab="backup">資料備份</button>`}
         </div>
       </div>
       <div class="meta">
@@ -1949,7 +2012,8 @@ function viewAdmin() {
     </div>
 
     <div class="panel${tab === 'fam' ? '' : ' hidden'}" id="famTab">
-      <h2 class="section-title">家族管理</h2>
+      <h2 class="section-title">${isMember ? '我管理的家族' : '家族管理'}</h2>
+      ${isMember ? '<p class="small muted">你可以在這裡新增自己的家族，並設定該家族在前台公開頁面的瀏覽權限；這裡只會顯示你自己新增（或被指派管理）的家族，不會看到其他人的家族。</p>' : ''}
       <div class="field-row" style="align-items:end;">
         <div class="field" style="max-width:300px;"><label>搜尋家族：</label><input type="text" id="famSearch" placeholder="輸入家族名稱"></div>
         <div class="field" style="max-width:200px;"><button class="btn" id="newFamBtn">＋ 新增家族</button></div>
@@ -1978,6 +2042,7 @@ function viewAdmin() {
       </div>
     </div>
 
+    ${isMember ? '' : `
     <div class="panel${tab === 'reg' ? '' : ' hidden'}" id="regTab">
       <h2 class="section-title">帳號申請</h2>
       <p class="small muted">前台「註冊帳號」送出的申請會顯示在這裡；確認聯繫後可選擇要開放的家族並核准建立登入帳號，或直接拒絕該申請。核准後申請人即可用自己設定的帳號密碼登入，並自動解鎖所選家族的授權碼區塊。</p>
@@ -2037,10 +2102,12 @@ function viewAdmin() {
       <p class="small muted" style="margin-top:10px; color:var(--red);">
         注意：匯入備份會「完全覆蓋」目前這台裝置上的所有資料，且此操作無法復原，請務必先確認備份檔案內容正確無誤（建議匯入前，先在此裝置上也匯出一份目前資料做為保險）。
       </p>
-    </div>`;
+    </div>`}
+`;
 }
 
 function wireAdmin() {
+  const isMember = currentUser().role === 'member';
   document.getElementById('toHomeBtn').addEventListener('click', () => go('home'));
   document.querySelectorAll('[data-logout]').forEach(b => b.addEventListener('click', logout));
   document.querySelectorAll('[data-tab]').forEach(btn => btn.addEventListener('click', () => {
@@ -2067,8 +2134,7 @@ function wireAdmin() {
   }
 
   renderFamList();
-  renderRegList();
-  renderPwList();
+  if (!isMember) { renderRegList(); renderPwList(); }
   document.getElementById('famSearch').addEventListener('input', renderFamList);
   document.getElementById('newFamBtn').addEventListener('click', () => {
     openModal(`
@@ -2124,63 +2190,71 @@ function wireAdmin() {
 
   refreshMemberTable();
 
-  // Full-database backup / restore (data-backup tab). See restoreDB() in
-  // 02-app.js for the merge/normalize logic used on import.
-  document.getElementById('exportDbBtn').addEventListener('click', () => exportFullBackup());
-  document.getElementById('importDbBtn').addEventListener('click', () => document.getElementById('importDbInput').click());
-  document.getElementById('importDbInput').addEventListener('change', (e) => {
-    const file = e.target.files[0];
-    e.target.value = '';
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
+  if (!isMember) {
+    // Full-database backup / restore (data-backup tab). See restoreDB() in
+    // 02-app.js for the merge/normalize logic used on import. Not shown to
+    // a 'member' account at all (see viewAdmin()) — a full-database
+    // export/import touches every family in the system, not just the ones
+    // a member manages, so it stays a global-admin-only operation.
+    document.getElementById('exportDbBtn').addEventListener('click', () => exportFullBackup());
+    document.getElementById('importDbBtn').addEventListener('click', () => document.getElementById('importDbInput').click());
+    document.getElementById('importDbInput').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        let parsed;
+        try { parsed = JSON.parse(reader.result); } catch (err) { toast('檔案格式錯誤，這不是有效的 JSON 檔案', true); return; }
+        if (!parsed || !Array.isArray(parsed.families) || !Array.isArray(parsed.members)) {
+          toast('這個檔案看起來不是可悠嵐族譜的備份檔，無法匯入', true);
+          return;
+        }
+        const memberCount = parsed.members.length, famCount = parsed.families.length;
+        if (!confirm(`確定要匯入這份備份嗎？\n\n匯入後將「完全覆蓋」目前這台裝置上的所有資料，改為備份檔中的內容（共 ${famCount} 個家族、${memberCount} 位成員），此操作無法復原。\n\n建議先按「取消」，用「匯出完整資料庫」保存一份目前的資料後，再回來匯入。`)) return;
+        restoreDB(parsed);
+        toast('已匯入備份資料');
+        state.params = { tab: 'fam' };
+        render();
+      };
+      reader.readAsText(file);
+    });
+
+    // Auto-saved recovery backups from a failed local read (see loadDB() /
+    // listRecoveryBackups() in 02-app.js). Only present when something went
+    // wrong loading the real data — most sessions will have none of these.
+    document.querySelectorAll('[data-restore-recovery]').forEach(btn => btn.addEventListener('click', () => {
+      const key = btn.dataset.restoreRecovery;
+      const raw = localStorage.getItem(key);
+      if (!raw) { toast('這份備份已經不存在了', true); render(); return; }
       let parsed;
-      try { parsed = JSON.parse(reader.result); } catch (err) { toast('檔案格式錯誤，這不是有效的 JSON 檔案', true); return; }
-      if (!parsed || !Array.isArray(parsed.families) || !Array.isArray(parsed.members)) {
-        toast('這個檔案看起來不是可悠嵐族譜的備份檔，無法匯入', true);
-        return;
-      }
-      const memberCount = parsed.members.length, famCount = parsed.families.length;
-      if (!confirm(`確定要匯入這份備份嗎？\n\n匯入後將「完全覆蓋」目前這台裝置上的所有資料，改為備份檔中的內容（共 ${famCount} 個家族、${memberCount} 位成員），此操作無法復原。\n\n建議先按「取消」，用「匯出完整資料庫」保存一份目前的資料後，再回來匯入。`)) return;
+      try { parsed = JSON.parse(raw); } catch (err) { toast('這份備份的內容已損毀，無法還原', true); return; }
+      if (!Array.isArray(parsed.families) || !Array.isArray(parsed.members)) { toast('這份備份的內容不完整，無法還原', true); return; }
+      if (!confirm(`確定要用這份自動保存的復原備份（${parsed.families.length} 個家族、${parsed.members.length} 位成員）覆蓋目前的資料嗎？此操作無法復原。`)) return;
       restoreDB(parsed);
-      toast('已匯入備份資料');
+      dbLoadError = null;
+      toast('已還原復原備份');
       state.params = { tab: 'fam' };
       render();
-    };
-    reader.readAsText(file);
-  });
-
-  // Auto-saved recovery backups from a failed local read (see loadDB() /
-  // listRecoveryBackups() in 02-app.js). Only present when something went
-  // wrong loading the real data — most sessions will have none of these.
-  document.querySelectorAll('[data-restore-recovery]').forEach(btn => btn.addEventListener('click', () => {
-    const key = btn.dataset.restoreRecovery;
-    const raw = localStorage.getItem(key);
-    if (!raw) { toast('這份備份已經不存在了', true); render(); return; }
-    let parsed;
-    try { parsed = JSON.parse(raw); } catch (err) { toast('這份備份的內容已損毀，無法還原', true); return; }
-    if (!Array.isArray(parsed.families) || !Array.isArray(parsed.members)) { toast('這份備份的內容不完整，無法還原', true); return; }
-    if (!confirm(`確定要用這份自動保存的復原備份（${parsed.families.length} 個家族、${parsed.members.length} 位成員）覆蓋目前的資料嗎？此操作無法復原。`)) return;
-    restoreDB(parsed);
-    dbLoadError = null;
-    toast('已還原復原備份');
-    state.params = { tab: 'fam' };
-    render();
-  }));
-  document.querySelectorAll('[data-discard-recovery]').forEach(btn => btn.addEventListener('click', () => {
-    const key = btn.dataset.discardRecovery;
-    if (!confirm('確定要捨棄這份復原備份嗎？捨棄後將無法再還原。')) return;
-    localStorage.removeItem(key);
-    toast('已捨棄這份備份');
-    render();
-  }));
+    }));
+    document.querySelectorAll('[data-discard-recovery]').forEach(btn => btn.addEventListener('click', () => {
+      const key = btn.dataset.discardRecovery;
+      if (!confirm('確定要捨棄這份復原備份嗎？捨棄後將無法再還原。')) return;
+      localStorage.removeItem(key);
+      toast('已捨棄這份備份');
+      render();
+    }));
+  }
 }
 
 function renderFamList() {
+  const user = currentUser();
+  const isMember = user.role === 'member';
   const q = (document.getElementById('famSearch').value || '').trim();
-  const families = q ? DB.families.filter(f => f.name.includes(q)) : DB.families;
+  let families = q ? DB.families.filter(f => f.name.includes(q)) : DB.families;
+  if (isMember) families = families.filter(f => f.auth_manager_user_id === user.id);
   const el = document.getElementById('famList');
-  if (!families.length) { el.innerHTML = '<p class="muted">尚無家族資料</p>'; return; }
+  if (!families.length) { el.innerHTML = `<p class="muted">${isMember ? '你目前還沒有管理任何家族，請按上方「＋ 新增家族」建立一個。' : '尚無家族資料'}</p>`; return; }
   const pageFields = [
     ['vis_home', '首頁家族資訊卡'], ['vis_tree', '家族家系圖'], ['vis_relation', '家族關係圖'],
     ['vis_list', '家族成員列表'], ['vis_query', '關係鍊查詢'], ['vis_stats', '家族統計'],
@@ -2306,6 +2380,7 @@ function guessFamilyId(familyNameText) {
 }
 function renderRegList() {
   const el = document.getElementById('regList');
+  if (!el) return;
   const requests = DB.registrationRequests.slice().sort((a, b) => b.created_at - a.created_at);
   if (!requests.length) { el.innerHTML = '<p class="muted">尚無註冊申請</p>'; return; }
   el.innerHTML = requests.map(r => {
@@ -2664,14 +2739,42 @@ function wireMemberEdit() {
   document.getElementById('uploadPhotoBtn').addEventListener('click', () => document.getElementById('photoInput').click());
   document.getElementById('photoInput').addEventListener('change', (e) => {
     const file = e.target.files[0];
+    e.target.value = '';
     if (!file) return;
+    // Member photos are embedded as base64 directly in DB.members and get
+    // pushed wholesale into a single Firestore document on every cloud
+    // sync (see scheduleCloudPush() in 02-app.js), which has a hard 1MiB
+    // limit — a raw phone photo (often 3-5MB) alone would blow past that.
+    // So every upload is resized (longest edge capped at ~800px, plenty
+    // for the sizes this app ever displays a photo at) and re-encoded as
+    // JPEG at a moderate quality via an offscreen <canvas> BEFORE being
+    // stored, instead of storing the original file untouched. This trades
+    // a little photo quality for keeping the whole family's photos well
+    // within the cloud sync budget. (Known simplification: this doesn't
+    // read EXIF orientation, so a photo taken with the phone rotated may
+    // come out sideways, same as many simple upload flows.)
     const reader = new FileReader();
     reader.onload = () => {
-      m.photo_data = reader.result;
-      persist();
-      document.getElementById('photoPreview').innerHTML = `<img src="${m.photo_data}">`;
-      toast('照片已上傳並儲存');
+      const img = new Image();
+      img.onload = () => {
+        const MAX_EDGE = 800;
+        const scale = Math.min(1, MAX_EDGE / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, w, h);
+        m.photo_data = canvas.toDataURL('image/jpeg', 0.8);
+        persist();
+        document.getElementById('photoPreview').innerHTML = `<img src="${m.photo_data}">`;
+        toast('照片已壓縮並儲存');
+      };
+      img.onerror = () => toast('照片讀取失敗，請換一張圖片再試', true);
+      img.src = reader.result;
     };
+    reader.onerror = () => toast('照片讀取失敗，請換一張圖片再試', true);
     reader.readAsDataURL(file);
   });
 
