@@ -946,6 +946,46 @@ function loadDB() {
 function persist() {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(DB)); } catch (e) { toast('瀏覽器儲存空間已滿，部分變更可能無法保存', true); }
 }
+/** Full-database backup file — the whole `DB` object (all families, members,
+ *  spouses, notes, accounts, id counters) as one JSON file, so it can be
+ *  carried to another device/browser by hand (see the 資料備份 admin tab).
+ *  This is separate from the tree-diagram exports in 04-app-tree.js, which
+ *  only export the rendered picture, not the underlying data. */
+async function exportFullBackup() {
+  const d = new Date();
+  const dateStr = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  const json = JSON.stringify(DB, null, 2);
+  const ok = await claudeSave(`可悠嵐族譜資料庫備份_${dateStr}.json`, json);
+  if (ok) toast('已匯出完整資料庫備份，請妥善保存這個 JSON 檔案');
+}
+
+/** Restore DB from a parsed backup JSON (see exportFullBackup above). Fills
+ *  in any fields an older/partial backup might be missing — same shape of
+ *  fallback as loadDB() uses for a freshly-parsed localStorage record — and
+ *  bumps every id counter past the highest id actually present so newly
+ *  created records after a restore never collide with restored ones. The
+ *  current browser's login session is kept as-is rather than taken from the
+ *  backup file, so importing a backup never logs the current user out. */
+function restoreDB(parsed) {
+  const keepSession = DB && DB.session;
+  DB = parsed;
+  DB.session = keepSession || { userId: null };
+  if (!Array.isArray(DB.users)) DB.users = [];
+  if (!Array.isArray(DB.families)) DB.families = [];
+  if (!Array.isArray(DB.members)) DB.members = [];
+  if (!Array.isArray(DB.spouses)) DB.spouses = [];
+  if (!DB.coupleNotes) DB.coupleNotes = {};
+  if (!Array.isArray(DB.registrationRequests)) DB.registrationRequests = [];
+  if (!DB.nextId) DB.nextId = {};
+  const maxId = (arr) => arr.reduce((m, x) => Math.max(m, x && x.id || 0), 0);
+  DB.nextId.user = Math.max(DB.nextId.user || 1, maxId(DB.users) + 1);
+  DB.nextId.family = Math.max(DB.nextId.family || 1, maxId(DB.families) + 1);
+  DB.nextId.member = Math.max(DB.nextId.member || 1, maxId(DB.members) + 1);
+  DB.nextId.spouse = DB.nextId.spouse || 1;
+  DB.nextId.regReq = Math.max(DB.nextId.regReq || 1, maxId(DB.registrationRequests) + 1);
+  persist();
+}
+
 function resetDemo() {
   if (!confirm('確定要清除所有本機資料，重新載入範本資料嗎？此操作無法復原。')) return;
   DB = seedDB();
@@ -1500,6 +1540,7 @@ function viewAdmin() {
           <button class="btn${tab === 'fam' ? ' active' : ''}" data-tab="fam">家族管理</button>
           <button class="btn${tab === 'mem' ? ' active' : ''}" data-tab="mem">成員維護</button>
           <button class="btn${tab === 'reg' ? ' active' : ''}" data-tab="reg">帳號申請${DB.registrationRequests.filter(r => !r.handled).length ? `（${DB.registrationRequests.filter(r => !r.handled).length}）` : ''}</button>
+          <button class="btn${tab === 'backup' ? ' active' : ''}" data-tab="backup">資料備份</button>
         </div>
       </div>
       <div class="meta">
@@ -1545,6 +1586,26 @@ function viewAdmin() {
       <h2 class="section-title">帳號申請</h2>
       <p class="small muted">前台「註冊帳號」送出的申請會顯示在這裡；確認聯繫後可標記為已處理。</p>
       <div id="regList"></div>
+    </div>
+
+    <div class="panel${tab === 'backup' ? '' : ' hidden'}" id="backupTab">
+      <h2 class="section-title">資料備份與還原</h2>
+      <p class="small muted" style="max-width:640px; line-height:1.8;">
+        這個預覽版的資料是儲存在「目前這一台裝置、這一個瀏覽器」裡，並沒有雲端伺服器──所以在電腦上輸入、儲存好的資料，換一支手機或另一個瀏覽器開啟同一個網址時，是看不到的，這是本系統目前的運作方式，不是資料遺失或損毀，電腦上原本的資料仍然完整保留、不受影響。<br><br>
+        若要在其他裝置（例如手機）上看到同一份資料，請照以下步驟：<br>
+        １．在資料原本所在的這台電腦上，按下方「匯出完整資料庫」，下載一個 JSON 備份檔。<br>
+        ２．把這個檔案傳到手機（例如用 LINE 傳給自己、或存到雲端硬碟再下載）。<br>
+        ３．在手機瀏覽器開啟同一個網址並登入後，回到這一頁，按「匯入資料庫」選擇剛剛的檔案即可還原。<br><br>
+        建議平時就養成習慣，資料異動較多後順手匯出一份備份保存起來。
+      </p>
+      <div class="btn-row" style="margin-top:16px;">
+        <button class="btn primary" id="exportDbBtn">匯出完整資料庫（JSON）</button>
+        <button class="btn" id="importDbBtn">匯入資料庫（還原備份）</button>
+        <input type="file" id="importDbInput" accept="application/json,.json" class="hidden">
+      </div>
+      <p class="small muted" style="margin-top:10px; color:var(--red);">
+        注意：匯入備份會「完全覆蓋」目前這台裝置上的所有資料，且此操作無法復原，請務必先確認備份檔案內容正確無誤（建議匯入前，先在此裝置上也匯出一份目前資料做為保險）。
+      </p>
     </div>`;
 }
 
@@ -1612,6 +1673,32 @@ function wireAdmin() {
   document.getElementById('exportExcelBtn').addEventListener('click', () => exportMembersExcel(Number(famSelect.value)));
 
   refreshMemberTable();
+
+  // Full-database backup / restore (data-backup tab). See restoreDB() in
+  // 02-app.js for the merge/normalize logic used on import.
+  document.getElementById('exportDbBtn').addEventListener('click', () => exportFullBackup());
+  document.getElementById('importDbBtn').addEventListener('click', () => document.getElementById('importDbInput').click());
+  document.getElementById('importDbInput').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let parsed;
+      try { parsed = JSON.parse(reader.result); } catch (err) { toast('檔案格式錯誤，這不是有效的 JSON 檔案', true); return; }
+      if (!parsed || !Array.isArray(parsed.families) || !Array.isArray(parsed.members)) {
+        toast('這個檔案看起來不是可悠嵐族譜的備份檔，無法匯入', true);
+        return;
+      }
+      const memberCount = parsed.members.length, famCount = parsed.families.length;
+      if (!confirm(`確定要匯入這份備份嗎？\n\n匯入後將「完全覆蓋」目前這台裝置上的所有資料，改為備份檔中的內容（共 ${famCount} 個家族、${memberCount} 位成員），此操作無法復原。\n\n建議先按「取消」，用「匯出完整資料庫」保存一份目前的資料後，再回來匯入。`)) return;
+      restoreDB(parsed);
+      toast('已匯入備份資料');
+      state.params = { tab: 'fam' };
+      render();
+    };
+    reader.readAsText(file);
+  });
 }
 
 function renderFamList() {
