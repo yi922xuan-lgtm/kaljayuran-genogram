@@ -1,1 +1,0 @@
-# kaljayuran-genogram
