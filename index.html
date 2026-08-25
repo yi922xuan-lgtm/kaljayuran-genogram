@@ -763,7 +763,7 @@ function toast(msg, isErr) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.className = el.className.replace('show', ''); }, 2600);
 }
-function roleLabel(role) { return { admin: '最高權限管理者', family_manager: '家族管理者', test: '測試帳號' }[role] || role; }
+function roleLabel(role) { return { admin: '最高權限管理者', family_manager: '家族管理者', test: '測試帳號', member: '會員（註冊申請帳號）' }[role] || role; }
 
 /** Guesses a MIME type from a filename's extension, for the plain-browser
  *  download fallback below (the Claude downloads capability infers this
@@ -889,7 +889,8 @@ function seedDB() {
     spouses: [],
     coupleNotes: {},
     registrationRequests: [],
-    nextId: { user: 2, family: 2, member: 1, spouse: 1, regReq: 1 },
+    pwResetRequests: [],
+    nextId: { user: 2, family: 2, member: 1, spouse: 1, regReq: 1, pwReset: 1 },
   };
 
   function addMember(f) {
@@ -951,7 +952,9 @@ function loadDB() {
       if (!parsed.nextId) parsed.nextId = {};
       if (!parsed.coupleNotes) parsed.coupleNotes = {};
       if (!parsed.registrationRequests) parsed.registrationRequests = [];
+      if (!parsed.pwResetRequests) parsed.pwResetRequests = [];
       if (!parsed.nextId.regReq) parsed.nextId.regReq = 1;
+      if (!parsed.nextId.pwReset) parsed.nextId.pwReset = 1;
       if (!parsed.updatedAt) parsed.updatedAt = 0;
       DB = parsed;
       return;
@@ -1150,6 +1153,7 @@ function restoreDB(parsed) {
   if (!Array.isArray(DB.spouses)) DB.spouses = [];
   if (!DB.coupleNotes) DB.coupleNotes = {};
   if (!Array.isArray(DB.registrationRequests)) DB.registrationRequests = [];
+  if (!Array.isArray(DB.pwResetRequests)) DB.pwResetRequests = [];
   if (!DB.nextId) DB.nextId = {};
   const maxId = (arr) => arr.reduce((m, x) => Math.max(m, x && x.id || 0), 0);
   DB.nextId.user = Math.max(DB.nextId.user || 1, maxId(DB.users) + 1);
@@ -1157,6 +1161,7 @@ function restoreDB(parsed) {
   DB.nextId.member = Math.max(DB.nextId.member || 1, maxId(DB.members) + 1);
   DB.nextId.spouse = DB.nextId.spouse || 1;
   DB.nextId.regReq = Math.max(DB.nextId.regReq || 1, maxId(DB.registrationRequests) + 1);
+  DB.nextId.pwReset = Math.max(DB.nextId.pwReset || 1, maxId(DB.pwResetRequests) + 1);
   persist();
 }
 
@@ -1304,6 +1309,10 @@ function logout() {
   persist();
   state.view = 'landing';
   state.params = {};
+  // A member's own approved family was auto-unlocked into this session's
+  // verifiedFamilies at login (see wireLogin) — clear it on logout so the
+  // next person to use this browser/tab doesn't inherit that unlock.
+  state.verifiedFamilies = new Set();
   render();
 }
 
@@ -1336,7 +1345,7 @@ function requireAuth() {
 }
 
 /* ================================================================ RENDER */
-const PUBLIC_ENTRY_VIEWS = new Set(['landing', 'login', 'register', 'pfam', 'authcode']);
+const PUBLIC_ENTRY_VIEWS = new Set(['landing', 'login', 'register', 'forgotpw', 'pfam', 'authcode']);
 /** Whether the current state.view is allowed to render as-is: an
  *  unauthenticated visitor may only reach the public entry views, or a
  *  content view (tree/relation/list/query/stats) that is explicitly in
@@ -1345,9 +1354,19 @@ const PUBLIC_ENTRY_VIEWS = new Set(['landing', 'login', 'register', 'pfam', 'aut
  *  this session. Everything else needs a logged-in user. This runs on
  *  every render() as a defense-in-depth check (not just at click time), so
  *  browser back/forward or a stale params object can't slip past a section
- *  that was never actually opened up. */
+ *  that was never actually opened up.
+ *
+ *  A 'member' account (self-registered, approved by an admin — see
+ *  帳號申請) is NOT a backend user: they get exactly the same reach as an
+ *  anonymous visitor — the public gallery and public/code-gated family
+ *  pages — never 後台管理 or member-edit. The one difference is their own
+ *  approved family's code-gated sections are already unlocked at login
+ *  (state.verifiedFamilies), so they never have to re-enter that family's
+ *  code. Only admin/family_manager/test accounts get the unconditional
+ *  full-access `true` below. */
 function viewIsAllowed() {
-  if (currentUser()) return true;
+  const cu = currentUser();
+  if (cu && cu.role !== 'member') return true;
   if (state.params && state.params.public) {
     const key = state.view === 'pfam' ? 'pfamHome' : state.view;
     const vis = publicVisOf(state.params.familyId, key);
@@ -1385,6 +1404,7 @@ function render() {
     case 'landing': app.innerHTML = viewLanding(); wireLanding(); break;
     case 'login': app.innerHTML = viewLogin(); wireLogin(); break;
     case 'register': app.innerHTML = viewRegister(); wireRegister(); break;
+    case 'forgotpw': app.innerHTML = viewForgotPassword(); wireForgotPassword(); break;
     case 'pfam': app.innerHTML = viewPublicFamilyHome(); wirePublicFamilyHome(); break;
     case 'authcode': app.innerHTML = viewAuthCode(); wireAuthCode(); break;
     case 'home': app.innerHTML = viewHome(); wireHome(); break;
@@ -1420,7 +1440,7 @@ function familyNav(activeKey, familyId) {
           <button class="btn sm" data-pnav="pfamHome">家族首頁</button>
           ${items.map(([key, label]) => `<button class="btn sm${key === activeKey ? ' active' : ''}" data-pnav="${key}">${label}</button>`).join('')}
           <button class="btn sm" data-pnav="landing">回總覽首頁</button>
-          <button class="btn sm" id="pnavLoginBtn">登入</button>
+          ${currentUser() ? '<button class="btn sm" data-logout="1">登出</button>' : '<button class="btn sm" id="pnavLoginBtn">登入</button>'}
         </div>
       </div>`;
   }
@@ -1453,6 +1473,7 @@ function wireCommonNav(root) {
     }));
     const loginBtn = root.querySelector('#pnavLoginBtn');
     if (loginBtn) loginBtn.addEventListener('click', () => go('login'));
+    root.querySelectorAll('[data-logout]').forEach(btn => btn.addEventListener('click', logout));
     return;
   }
   root.querySelectorAll('[data-nav]').forEach(btn => btn.addEventListener('click', () => {
@@ -1478,23 +1499,169 @@ function viewLogin() {
           <button type="submit" class="btn primary" id="loginBtn">登入</button>
           <p class="error-msg" id="errMsg"></p>
         </form>
+        <button type="button" class="btn-link" id="toForgotPwBtn" style="width:100%; margin-top:6px; background:none; border:none; color:var(--red); text-decoration:underline; cursor:pointer; font-size:14px;">忘記密碼？</button>
         <button type="button" class="btn" id="loginBackBtn" style="width:100%; margin-top:10px;">回首頁</button>
       </div>
     </div>`;
 }
 function wireLogin() {
   document.getElementById('loginBackBtn').addEventListener('click', () => go('landing'));
+  document.getElementById('toForgotPwBtn').addEventListener('click', () => go('forgotpw'));
   document.getElementById('loginForm').addEventListener('submit', (e) => {
     e.preventDefault();
     const u = document.getElementById('lu').value;
     const p = document.getElementById('lp').value;
     const err = document.getElementById('errMsg');
-    // Login is the doorway straight into 族譜後台 (the highest-permission
-    // admin/edit screen) — the public gallery and per-family pages below
-    // never require an account, so a successful login has nowhere else
-    // useful to land.
-    if (login(u, p)) { err.textContent = ''; goReplace('admin', { tab: 'fam' }); }
-    else { err.textContent = '帳號或密碼錯誤'; }
+    // Login is normally the doorway straight into 族譜後台 (the
+    // highest-permission admin/edit screen) — the public gallery and
+    // per-family pages below never require an account for that, so a
+    // successful admin/family_manager/test login has nowhere else useful to
+    // land. A self-registered 'member' account is different: it has no
+    // backend access at all (see viewIsAllowed), so it lands back on the
+    // public gallery instead — with their own approved family's code-gated
+    // sections already unlocked for this session, so they don't have to
+    // re-enter that family's code every visit.
+    if (login(u, p)) {
+      err.textContent = '';
+      const cu = currentUser();
+      if (cu.role === 'member') {
+        if (cu.approved_family_id) state.verifiedFamilies.add(Number(cu.approved_family_id));
+        goReplace('landing');
+      } else {
+        goReplace('admin', { tab: 'fam' });
+      }
+    } else { err.textContent = '帳號或密碼錯誤'; }
+  });
+}
+
+/* ------------------------------------------------------------ FORGOT PW */
+/** Self-service password reset — ONE entry point that branches on what
+ *  kind of account the typed username belongs to:
+ *   - member/other accounts: mirrors the 註冊帳號 flow — queues a request
+ *     in DB.pwResetRequests with a contact detail, for an admin to review
+ *     and approve in 後台管理 → 忘記密碼 (see renderPwList()). There's no
+ *     email/SMS in this app to verify identity automatically, so a human
+ *     check by the admin is the substitute.
+ *   - the admin account itself: there's no higher authority to approve a
+ *     request FOR the admin (approving one requires already being logged
+ *     in as admin), so that path would be a dead end. Instead, if the
+ *     admin has pre-configured a recovery question/answer (see the
+ *     "設定我的密碼救援問答" box admin-only in 後台管理 → 忘記密碼), they
+ *     can answer it here and reset their own password immediately, no
+ *     approval needed — the recovery answer itself stands in for
+ *     approval. If they never set one up, this honestly says so instead
+ *     of silently failing; there is no way around that without some
+ *     outside channel (email/SMS) this static app doesn't have.
+ *  The recovery answer is stored in plain text on the user record
+ *  (recovery_question/recovery_answer), matching how login passwords are
+ *  already stored in plain text throughout this app (see DB.users) — not
+ *  hardened, but consistent with the rest of this hobby-scale app's
+ *  security bar, and the admin is told to pick an answer nobody else
+ *  could guess. */
+function viewForgotPassword() {
+  return `
+    <div class="login-wrap">
+      <div class="login-box">
+        <h1 class="display" style="font-size:20px;">忘記密碼</h1>
+        <p class="sub" id="fpIntro">請先輸入登入帳號：一般會員帳號需送出申請由管理者核准；最高權限管理者帳號若已設定救援問答，可直接回答問題自行重設密碼，不需任何人核准。</p>
+        <form id="forgotPwForm">
+          <div class="field"><label for="fpUsername">登入帳號</label><input type="text" id="fpUsername" autocomplete="username"></div>
+          <div id="fpMemberFields">
+            <div class="field"><label for="fpContact">聯絡方式（電話或Email，供管理者核對身分）</label><input type="text" id="fpContact"></div>
+          </div>
+          <div id="fpAdminFields" class="hidden">
+            <p class="small muted" id="fpQuestionText"></p>
+            <div class="field"><label for="fpAnswer">救援答案</label><input type="text" id="fpAnswer" autocomplete="off"></div>
+          </div>
+          <p class="error-msg hidden" id="fpAdminNotConfigured" style="color:var(--red);">此帳號尚未事先設定救援問答，無法自助重設密碼；請透過其他方式（例如直接於本機瀏覽器資料中確認，或請熟悉系統的人協助）取得原密碼。</p>
+          <div class="field"><label for="fpPassword">新密碼</label><input type="password" id="fpPassword" autocomplete="new-password"></div>
+          <div class="field"><label for="fpPassword2">確認新密碼</label><input type="password" id="fpPassword2" autocomplete="new-password"></div>
+          <button type="submit" class="btn primary" id="fpSubmitBtn">送出重設密碼申請</button>
+          <p class="error-msg" id="fpErr"></p>
+        </form>
+        <button type="button" class="btn" id="fpBackBtn" style="width:100%; margin-top:10px;">回登入頁</button>
+      </div>
+    </div>`;
+}
+function wireForgotPassword() {
+  document.getElementById('fpBackBtn').addEventListener('click', () => go('login'));
+  const uInput = document.getElementById('fpUsername');
+  const memberFields = document.getElementById('fpMemberFields');
+  const adminFields = document.getElementById('fpAdminFields');
+  const notConfiguredMsg = document.getElementById('fpAdminNotConfigured');
+  const questionText = document.getElementById('fpQuestionText');
+  const submitBtn = document.getElementById('fpSubmitBtn');
+  let mode = 'member'; // 'member' | 'admin' | 'admin-unset'
+
+  function refreshMode() {
+    const uname = uInput.value.trim();
+    const user = DB.users.find(u => u.username === uname);
+    memberFields.classList.add('hidden');
+    adminFields.classList.add('hidden');
+    notConfiguredMsg.classList.add('hidden');
+    if (user && user.role === 'admin') {
+      if (user.recovery_question && user.recovery_answer) {
+        mode = 'admin';
+        adminFields.classList.remove('hidden');
+        questionText.textContent = `救援問題：${user.recovery_question}`;
+      } else {
+        mode = 'admin-unset';
+        notConfiguredMsg.classList.remove('hidden');
+      }
+      submitBtn.textContent = '回答並重設密碼';
+    } else {
+      mode = 'member';
+      memberFields.classList.remove('hidden');
+      submitBtn.textContent = '送出重設密碼申請';
+    }
+  }
+  uInput.addEventListener('input', refreshMode);
+  refreshMode();
+
+  document.getElementById('forgotPwForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const username = uInput.value.trim();
+    const password = document.getElementById('fpPassword').value;
+    const password2 = document.getElementById('fpPassword2').value;
+    const err = document.getElementById('fpErr');
+    if (!username) { err.textContent = '請輸入登入帳號'; return; }
+    const user = DB.users.find(u => u.username === username);
+    if (!user) { err.textContent = '查無此登入帳號，請確認輸入是否正確'; return; }
+    if (!password || password.length < 4) { err.textContent = '新密碼至少需 4 碼'; return; }
+    if (password !== password2) { err.textContent = '兩次輸入的新密碼不一致'; return; }
+
+    if (mode === 'admin-unset') {
+      err.textContent = '此帳號尚未事先設定救援問答，無法自助重設密碼';
+      return;
+    }
+    if (mode === 'admin') {
+      const answer = document.getElementById('fpAnswer').value.trim();
+      if (!answer) { err.textContent = '請輸入救援答案'; return; }
+      if (answer.toLowerCase() !== String(user.recovery_answer || '').trim().toLowerCase()) {
+        err.textContent = '救援答案不正確';
+        return;
+      }
+      user.password = password;
+      persist();
+      err.textContent = '';
+      toast('密碼已重設，請用新密碼登入');
+      go('login');
+      return;
+    }
+
+    // Default/member flow: queue for admin approval, unchanged behavior.
+    const contact = document.getElementById('fpContact').value.trim();
+    if (!contact) { err.textContent = '請填寫聯絡方式，供管理者核對身分'; return; }
+    if (DB.pwResetRequests.some(r => !r.handled && r.username === username)) { err.textContent = '此帳號已有其他重設申請在審核中，請耐心等候'; return; }
+    const id = DB.nextId.pwReset++;
+    DB.pwResetRequests.push({
+      id, username, contact, new_password: password,
+      created_at: Date.now(), handled: 0, approved: 0,
+    });
+    persist();
+    err.textContent = '';
+    toast('重設密碼申請已送出，請等待管理者核准');
+    go('login');
   });
 }
 
@@ -1507,6 +1674,16 @@ function wireLogin() {
 function viewLanding() {
   const families = DB.families;
   const publicFamilies = families.filter(f => (f.vis_home || 'private') !== 'private');
+  const cu = currentUser();
+  // A logged-in 'member' account browses this same public gallery (see
+  // viewIsAllowed) — swap the 登入／註冊帳號 buttons for a name readout and
+  // 登出 rather than showing a login prompt to someone already logged in.
+  // admin/family_manager/test accounts never linger on this view (login
+  // sends them straight to 後台管理), so this branch is really only ever
+  // seen by a member.
+  const authButtons = cu
+    ? `<span class="stat-chip" style="align-self:center;">已登入：${escapeHtml(cu.display_name)}</span><button class="btn" data-logout="1">登出</button>`
+    : `<button class="btn" id="toLoginBtn">登入</button><button class="btn" id="toRegisterBtn">註冊帳號</button>`;
   return `
     <div class="topbar">
       <div>
@@ -1514,8 +1691,7 @@ function viewLanding() {
         <p class="subtitle">${escapeHtml(ORG_NAME)} 建置維護</p>
         <div class="btn-row">
           <button class="btn active">首頁</button>
-          <button class="btn" id="toLoginBtn">登入</button>
-          <button class="btn" id="toRegisterBtn">註冊帳號</button>
+          ${authButtons}
         </div>
       </div>
       <div class="topbar-stats">
@@ -1540,8 +1716,11 @@ function viewLanding() {
     </div>`;
 }
 function wireLanding() {
-  document.getElementById('toLoginBtn').addEventListener('click', () => go('login'));
-  document.getElementById('toRegisterBtn').addEventListener('click', () => go('register'));
+  const loginBtn = document.getElementById('toLoginBtn');
+  if (loginBtn) loginBtn.addEventListener('click', () => go('login'));
+  const registerBtn = document.getElementById('toRegisterBtn');
+  if (registerBtn) registerBtn.addEventListener('click', () => go('register'));
+  document.querySelectorAll('[data-logout]').forEach(b => b.addEventListener('click', logout));
   document.querySelectorAll('[data-open]').forEach(card => card.addEventListener('click', () => goPublicSection('pfamHome', Number(card.dataset.open))));
 }
 
@@ -1567,7 +1746,7 @@ function viewPublicFamilyHome() {
       </div>
       <div class="nav-links">
         <button class="btn sm" data-pnav="landing">回首頁</button>
-        <button class="btn sm" id="pnavLoginBtn">登入</button>
+        ${currentUser() ? '<button class="btn sm" data-logout="1">登出</button>' : '<button class="btn sm" id="pnavLoginBtn">登入</button>'}
       </div>
     </div>
     <div class="panel">
@@ -1589,7 +1768,9 @@ function viewPublicFamilyHome() {
 function wirePublicFamilyHome() {
   const familyId = state.params.familyId;
   document.querySelectorAll('[data-pnav="landing"]').forEach(b => b.addEventListener('click', () => go('landing')));
-  document.getElementById('pnavLoginBtn').addEventListener('click', () => go('login'));
+  const loginBtn = document.getElementById('pnavLoginBtn');
+  if (loginBtn) loginBtn.addEventListener('click', () => go('login'));
+  document.querySelectorAll('[data-logout]').forEach(b => b.addEventListener('click', logout));
   document.querySelectorAll('[data-pgoto]').forEach(b => b.addEventListener('click', () => goPublicSection(b.dataset.pgoto, familyId)));
 }
 
@@ -1641,12 +1822,15 @@ function viewRegister() {
     <div class="login-wrap">
       <div class="login-box">
         <h1 class="display" style="font-size:20px;">註冊帳號申請</h1>
-        <p class="sub">請填寫以下資料，我們將由管理者審核後與您聯繫。</p>
+        <p class="sub">請填寫以下資料並自訂登入帳號密碼，管理者核准後即可用此帳號密碼登入。</p>
         <form id="registerForm">
           <div class="field"><label for="rgName">姓名／族名</label><input type="text" id="rgName"></div>
           <div class="field"><label for="rgContact">聯絡方式（電話或Email）</label><input type="text" id="rgContact"></div>
           <div class="field"><label for="rgFamily">所屬家族（選填）</label><input type="text" id="rgFamily"></div>
           <div class="field"><label for="rgNote">申請說明（選填）</label><textarea id="rgNote" rows="3"></textarea></div>
+          <div class="field"><label for="rgUsername">登入帳號</label><input type="text" id="rgUsername" autocomplete="username"></div>
+          <div class="field"><label for="rgPassword">登入密碼</label><input type="password" id="rgPassword" autocomplete="new-password"></div>
+          <div class="field"><label for="rgPassword2">確認密碼</label><input type="password" id="rgPassword2" autocomplete="new-password"></div>
           <button type="submit" class="btn primary" id="rgSubmitBtn">送出申請</button>
           <p class="error-msg" id="rgErr"></p>
         </form>
@@ -1660,18 +1844,32 @@ function wireRegister() {
     e.preventDefault();
     const name = document.getElementById('rgName').value.trim();
     const contact = document.getElementById('rgContact').value.trim();
+    const username = document.getElementById('rgUsername').value.trim();
+    const password = document.getElementById('rgPassword').value;
+    const password2 = document.getElementById('rgPassword2').value;
     const err = document.getElementById('rgErr');
     if (!name || !contact) { err.textContent = '請填寫姓名與聯絡方式'; return; }
+    if (!username) { err.textContent = '請設定登入帳號'; return; }
+    if (!password || password.length < 4) { err.textContent = '密碼至少需 4 碼'; return; }
+    if (password !== password2) { err.textContent = '兩次輸入的密碼不一致'; return; }
+    // Usernames are the login key, so they must be unique both against
+    // already-approved accounts AND any other still-pending request — once
+    // a request is approved or rejected (handled=1) its username no longer
+    // blocks a fresh one, matching how an approved account's own username
+    // is what actually ends up reserved going forward.
+    if (DB.users.some(u => u.username === username)) { err.textContent = '此帳號名稱已被使用，請更換'; return; }
+    if (DB.registrationRequests.some(r => !r.handled && r.username === username)) { err.textContent = '此帳號名稱已有其他申請案在審核中，請更換'; return; }
     const id = DB.nextId.regReq++;
     DB.registrationRequests.push({
       id, name, contact,
       family_name: document.getElementById('rgFamily').value.trim(),
       note: document.getElementById('rgNote').value.trim(),
-      created_at: Date.now(), handled: 0,
+      username, password,
+      created_at: Date.now(), handled: 0, approved: 0, family_id: null, user_id: null,
     });
     persist();
     err.textContent = '';
-    toast('註冊申請已送出，請等待管理者審核');
+    toast('註冊申請已送出，請等待管理者審核並核准帳號');
     go('landing');
   });
 }
@@ -1737,6 +1935,7 @@ function viewAdmin() {
           <button class="btn${tab === 'fam' ? ' active' : ''}" data-tab="fam">家族管理</button>
           <button class="btn${tab === 'mem' ? ' active' : ''}" data-tab="mem">成員維護</button>
           <button class="btn${tab === 'reg' ? ' active' : ''}" data-tab="reg">帳號申請${DB.registrationRequests.filter(r => !r.handled).length ? `（${DB.registrationRequests.filter(r => !r.handled).length}）` : ''}</button>
+          <button class="btn${tab === 'pw' ? ' active' : ''}" data-tab="pw">忘記密碼${DB.pwResetRequests.filter(r => !r.handled).length ? `（${DB.pwResetRequests.filter(r => !r.handled).length}）` : ''}</button>
           <button class="btn${tab === 'backup' ? ' active' : ''}" data-tab="backup">資料備份</button>
         </div>
       </div>
@@ -1781,8 +1980,26 @@ function viewAdmin() {
 
     <div class="panel${tab === 'reg' ? '' : ' hidden'}" id="regTab">
       <h2 class="section-title">帳號申請</h2>
-      <p class="small muted">前台「註冊帳號」送出的申請會顯示在這裡；確認聯繫後可標記為已處理。</p>
+      <p class="small muted">前台「註冊帳號」送出的申請會顯示在這裡；確認聯繫後可選擇要開放的家族並核准建立登入帳號，或直接拒絕該申請。核准後申請人即可用自己設定的帳號密碼登入，並自動解鎖所選家族的授權碼區塊。</p>
       <div id="regList"></div>
+    </div>
+
+    <div class="panel${tab === 'pw' ? '' : ' hidden'}" id="pwTab">
+      <h2 class="section-title">忘記密碼</h2>
+      ${user.role === 'admin' ? `
+      <div style="margin-bottom:20px; padding:16px; border:2px solid var(--red); border-radius:8px; background:#fff7f6;">
+        <h3 style="margin:0 0 8px;">🔑 設定我的密碼救援問答（僅最高權限管理者看得到這區）</h3>
+        <p class="small muted">你（${escapeHtml(user.username)}）是系統唯一的最高權限管理者，沒有其他人能核准「忘記密碼」申請給你。先在這裡設定一組救援問答，日後若忘記密碼，就能在登入頁「忘記密碼」直接回答問題自行重設密碼，不需要任何人核准。請設定一個別人猜不到、但自己一定記得的答案，並自行妥善保管（例如寫在紙本或密碼管理工具中）——這組答案跟登入密碼一樣是以明文存放在本機資料裡。</p>
+        <p class="small">目前狀態：${user.recovery_question && user.recovery_answer ? `<strong style="color:#2a7a3b;">已設定</strong>（問題：${escapeHtml(user.recovery_question)}）` : '<strong style="color:var(--red);">尚未設定</strong>'}</p>
+        <div class="field-row" style="align-items:end;">
+          <div class="field"><label>救援問題</label><input type="text" id="recoQuestion" placeholder="例如：我第一隻養的寵物叫什麼名字？" value="${escapeHtml(user.recovery_question || '')}"></div>
+          <div class="field"><label>救援答案</label><input type="text" id="recoAnswer" autocomplete="off" placeholder="重新輸入以設定或變更"></div>
+          <div class="field"><label>確認答案</label><input type="text" id="recoAnswer2" autocomplete="off"></div>
+          <div class="field" style="flex:0;"><button class="btn" id="recoSaveBtn">儲存救援設定</button></div>
+        </div>
+      </div>` : ''}
+      <p class="small muted">前台登入頁「忘記密碼？」送出的重設申請會顯示在這裡；請先用聯絡方式核對申請人身分，確認無誤後按「核准，套用新密碼」，該帳號即可用申請時填寫的新密碼登入。若無法確認身分，請按拒絕。</p>
+      <div id="pwList"></div>
     </div>
 
     <div class="panel${tab === 'backup' ? '' : ' hidden'}" id="backupTab">
@@ -1831,8 +2048,27 @@ function wireAdmin() {
     render();
   }));
 
+  const recoSaveBtn = document.getElementById('recoSaveBtn');
+  if (recoSaveBtn) {
+    recoSaveBtn.addEventListener('click', () => {
+      const question = document.getElementById('recoQuestion').value.trim();
+      const answer = document.getElementById('recoAnswer').value.trim();
+      const answer2 = document.getElementById('recoAnswer2').value.trim();
+      if (!question) return toast('請輸入救援問題', true);
+      if (!answer) return toast('請輸入救援答案', true);
+      if (answer !== answer2) return toast('兩次輸入的救援答案不一致', true);
+      const user = currentUser();
+      user.recovery_question = question;
+      user.recovery_answer = answer;
+      persist();
+      toast('救援設定已儲存');
+      render();
+    });
+  }
+
   renderFamList();
   renderRegList();
+  renderPwList();
   document.getElementById('famSearch').addEventListener('input', renderFamList);
   document.getElementById('newFamBtn').addEventListener('click', () => {
     openModal(`
@@ -2054,28 +2290,137 @@ function renderFamList() {
   }));
 }
 
+/** Best-effort pre-select for the family-approval dropdown: the requester
+ *  typed a free-text family name (they may not know its exact/current
+ *  name), so try an exact match first, then a loose substring match either
+ *  direction, before falling back to just the first family in the list —
+ *  the admin always sees and can change the selection before approving, so
+ *  a wrong guess here only costs one extra click, never a wrong grant. */
+function guessFamilyId(familyNameText) {
+  const q = (familyNameText || '').trim();
+  if (!q || !DB.families.length) return DB.families[0] ? DB.families[0].id : null;
+  const exact = DB.families.find(f => f.name === q);
+  if (exact) return exact.id;
+  const loose = DB.families.find(f => f.name.includes(q) || q.includes(f.name));
+  return (loose || DB.families[0]).id;
+}
 function renderRegList() {
   const el = document.getElementById('regList');
   const requests = DB.registrationRequests.slice().sort((a, b) => b.created_at - a.created_at);
   if (!requests.length) { el.innerHTML = '<p class="muted">尚無註冊申請</p>'; return; }
-  el.innerHTML = requests.map(r => `
+  el.innerHTML = requests.map(r => {
+    const statusBadge = !r.handled ? '<span class="badge">待審核</span>'
+      : r.approved ? '<span class="badge">已核准</span>' : '<span class="badge">已拒絕</span>';
+    const approvedFam = r.approved && r.family_id ? familyById(r.family_id) : null;
+    let actionHtml;
+    if (!r.handled) {
+      const guessId = guessFamilyId(r.family_name);
+      actionHtml = `
+        <div class="field" style="max-width:220px;">
+          <label>核准後開放家族</label>
+          <select id="regFam-${r.id}">${DB.families.map(f => `<option value="${f.id}" ${f.id === guessId ? 'selected' : ''}>${escapeHtml(f.name)}</option>`).join('')}</select>
+        </div>
+        <button class="btn sm primary" data-approve="${r.id}">核准並建立帳號</button>
+        <button class="btn sm" data-reject="${r.id}">拒絕</button>`;
+    } else if (r.approved) {
+      actionHtml = `<div class="muted small">帳號：${escapeHtml(r.username || '')}　開放家族：${escapeHtml(approvedFam ? approvedFam.name : '（家族已刪除）')}</div>`;
+    } else {
+      actionHtml = '';
+    }
+    return `
     <div class="fam-row" data-req="${r.id}">
       <div class="fam-head">
         <div class="fam-name-col">
           <strong>${escapeHtml(r.name)}</strong>
           <div class="muted small">${escapeHtml(r.contact)}</div>
-          ${r.family_name ? `<div class="muted small">所屬家族：${escapeHtml(r.family_name)}</div>` : ''}
+          ${r.username ? `<div class="muted small">申請帳號：${escapeHtml(r.username)}</div>` : ''}
+          ${r.family_name ? `<div class="muted small">所屬家族（申請人填寫）：${escapeHtml(r.family_name)}</div>` : ''}
           ${r.note ? `<div class="muted small">說明：${escapeHtml(r.note)}</div>` : ''}
         </div>
         <div class="fam-func-col">
-          <span class="badge">${r.handled ? '已處理' : '待處理'}</span>
-          ${r.handled ? '' : `<button class="btn sm primary" data-mark-handled="${r.id}">標記已處理</button>`}
+          ${statusBadge}
+          ${actionHtml}
         </div>
       </div>
-    </div>`).join('');
-  el.querySelectorAll('[data-mark-handled]').forEach(b => b.addEventListener('click', () => {
-    const req = DB.registrationRequests.find(r => r.id === Number(b.dataset.markHandled));
-    if (req) { req.handled = 1; persist(); toast('已標記為已處理'); renderRegList(); render(); }
+    </div>`;
+  }).join('');
+  el.querySelectorAll('[data-approve]').forEach(b => b.addEventListener('click', () => {
+    const req = DB.registrationRequests.find(r => r.id === Number(b.dataset.approve));
+    if (!req) return;
+    const sel = document.getElementById(`regFam-${req.id}`);
+    const famId = sel ? Number(sel.value) : null;
+    if (!famId) { toast('請先選擇要開放的家族', true); return; }
+    if (!req.username || !req.password) { toast('此申請缺少帳號密碼資料，無法核准；請請申請人重新申請一次', true); return; }
+    if (DB.users.some(u => u.username === req.username)) { toast('此帳號名稱已被使用，請請申請人更換帳號名稱後重新申請', true); return; }
+    const id = DB.nextId.user++;
+    DB.users.push({ id, username: req.username, password: req.password, display_name: req.name, role: 'member', approved_family_id: famId });
+    req.handled = 1; req.approved = 1; req.family_id = famId; req.user_id = id;
+    persist();
+    toast('已核准，登入帳號已建立');
+    renderRegList();
+    render();
+  }));
+  el.querySelectorAll('[data-reject]').forEach(b => b.addEventListener('click', () => {
+    const req = DB.registrationRequests.find(r => r.id === Number(b.dataset.reject));
+    if (req) { req.handled = 1; req.approved = 0; persist(); toast('已拒絕此申請'); renderRegList(); render(); }
+  }));
+}
+
+/** Admin review queue for 前台「忘記密碼」 requests — same approve/reject
+ *  pattern as renderRegList(), but approving here doesn't create a new
+ *  account: it overwrites the matching DB.users entry's existing password
+ *  with the new one the requester chose. If that account was deleted or
+ *  renamed since the request was filed, approval is blocked with a clear
+ *  error rather than silently doing nothing. */
+function renderPwList() {
+  const el = document.getElementById('pwList');
+  if (!el) return;
+  const requests = DB.pwResetRequests.slice().sort((a, b) => b.created_at - a.created_at);
+  if (!requests.length) { el.innerHTML = '<p class="muted">尚無密碼重設申請</p>'; return; }
+  el.innerHTML = requests.map(r => {
+    const statusBadge = !r.handled ? '<span class="badge">待審核</span>'
+      : r.approved ? '<span class="badge">已核准</span>' : '<span class="badge">已拒絕</span>';
+    const accountExists = DB.users.some(u => u.username === r.username);
+    let actionHtml;
+    if (!r.handled) {
+      actionHtml = `
+        ${!accountExists ? '<div class="muted small" style="color:var(--red);">⚠️ 找不到此登入帳號，可能已被刪除或改名</div>' : ''}
+        <button class="btn sm primary" data-pw-approve="${r.id}"${accountExists ? '' : ' disabled'}>核准，套用新密碼</button>
+        <button class="btn sm" data-pw-reject="${r.id}">拒絕</button>`;
+    } else if (r.approved) {
+      actionHtml = '<div class="muted small">密碼已重設完成</div>';
+    } else {
+      actionHtml = '';
+    }
+    return `
+    <div class="fam-row" data-pwreq="${r.id}">
+      <div class="fam-head">
+        <div class="fam-name-col">
+          <strong>${escapeHtml(r.username)}</strong>
+          <div class="muted small">${escapeHtml(r.contact)}</div>
+        </div>
+        <div class="fam-func-col">
+          ${statusBadge}
+          ${actionHtml}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('[data-pw-approve]').forEach(b => b.addEventListener('click', () => {
+    const req = DB.pwResetRequests.find(r => r.id === Number(b.dataset.pwApprove));
+    if (!req) return;
+    const user = DB.users.find(u => u.username === req.username);
+    if (!user) { toast('找不到此登入帳號，無法套用新密碼', true); return; }
+    user.password = req.new_password;
+    req.handled = 1; req.approved = 1;
+    persist();
+    toast('已核准，密碼已更新');
+    renderPwList();
+    render();
+  }));
+  el.querySelectorAll('[data-pw-reject]').forEach(b => b.addEventListener('click', () => {
+    const req = DB.pwResetRequests.find(r => r.id === Number(b.dataset.pwReject));
+    if (req) { req.handled = 1; req.approved = 0; persist(); toast('已拒絕此申請'); renderPwList(); render(); }
   }));
 }
 
@@ -4033,7 +4378,19 @@ function init() {
     document.body.appendChild(c);
   }
   loadDB();
-  if (currentUser()) state.view = 'home'; else state.view = 'landing';
+  const bootUser = currentUser();
+  if (bootUser && bootUser.role !== 'member') {
+    state.view = 'home';
+  } else {
+    state.view = 'landing';
+    // A member's session persists across page loads (DB.session.userId is
+    // saved), but state.verifiedFamilies is fresh in-memory state each
+    // load — re-seed it from their approved family so a returning member
+    // doesn't have to re-enter that family's code every visit.
+    if (bootUser && bootUser.role === 'member' && bootUser.approved_family_id) {
+      state.verifiedFamilies.add(Number(bootUser.approved_family_id));
+    }
+  }
   render();
   initCloudSync();
 }
