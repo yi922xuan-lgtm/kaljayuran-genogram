@@ -2400,11 +2400,20 @@ function wireMemberEdit() {
 // drop (46px below a frame's bottom, see buildTreeLayout's parentEdges loop)
 // plus the next row's generation-badge protrusion (20px above its frame) —
 // otherwise that horizontal bus line lands inside the next generation's
-// cards instead of the empty gap between rows. COL_GAP/COL_GAP_INNER (the
-// left-right spacing) were tightened for compaction; ROW_H/MARGIN (the
-// up-down spacing) intentionally were not — keep them at their original,
-// clearance-safe values.
-const NODE_W = 260, NODE_H = 404, FRAME_PAD = 20, COL_GAP_INNER = 24, COL_GAP = 40, ROW_H = 474, MARGIN = 70;
+// cards instead of the empty gap between rows. That hard minimum is only
+// 66px; ROW_H is deliberately set well above it (156px of clear gap) so
+// generations read as visually separate rows rather than barely clearing a
+// collision. COL_GAP/COL_GAP_INNER (the left-right spacing) were tightened
+// for compaction previously; see COL_GAP_SIBLING below for how full siblings
+// now pack tighter than separate family branches.
+const NODE_W = 260, NODE_H = 404, FRAME_PAD = 20, COL_GAP_INNER = 24, COL_GAP = 56, ROW_H = 560, MARGIN = 70;
+// Two adjacent lanes belonging to the very same parent couple (true full
+// siblings) pack tighter than lanes that belong to different parents — this
+// is what visually clusters each nuclear family into its own tight group
+// instead of every leaf looking evenly, indiscriminately spaced. COL_GAP
+// above is now the "different family" gap; COL_GAP_SIBLING is the "same
+// parents" gap.
+const COL_GAP_SIBLING = 24;
 // A spouse's name/tribal text renders in this blue, distinguishing anyone who
 // married into the family from the blood-line members around them (black).
 const SPOUSE_INK = '#1d5fa8';
@@ -2563,6 +2572,24 @@ function buildTreeLayout(members) {
   for (const rid of rootIds) assignColumns(rid);
   for (const u of units) if (!colOf.has(u.id)) assignColumns(u.id);
 
+  // Immediate parent unit of each unit (the couple whose childUnitIds this
+  // unit appears in) — used below to tell "true full siblings" (same parent
+  // couple) apart from unrelated adjacent branches, so siblings can pack
+  // tighter than the gap between separate families.
+  const parentOf = new Map();
+  for (const u of units) for (const cid of u.childUnitIds) parentOf.set(cid, u.id);
+  // Only a unit with its own integer lane (a leaf-like branch — see the
+  // colCursor assignment above) owns a lane outright; this maps lane index
+  // back to that unit so adjacent-lane gaps can compare their parents.
+  const unitOfLane = new Map();
+  for (const u of units) { const c = colOf.get(u.id); if (Number.isInteger(c)) unitOfLane.set(c, u.id); }
+  function gapBetweenLanes(lo, hi) {
+    const a = unitOfLane.get(lo), b = unitOfLane.get(hi);
+    if (a === undefined || b === undefined) return COL_GAP;
+    const pa = parentOf.get(a), pb = parentOf.get(b);
+    return (pa !== undefined && pa === pb) ? COL_GAP_SIBLING : COL_GAP;
+  }
+
   const soloUnitWidth = FRAME_PAD * 2 + NODE_W;
   const unitWidthOf = (u) => FRAME_PAD * 2 + NODE_W * u.members.length + COL_GAP_INNER * Math.max(0, u.members.length - 1);
 
@@ -2597,23 +2624,29 @@ function buildTreeLayout(members) {
     if (Number.isInteger(col)) continue;
     const lo = Math.floor(col), hi = Math.ceil(col);
     const need = unitWidthOf(u);
-    const available = (laneWidth.get(lo) + COL_GAP + laneWidth.get(hi)) / 2;
+    const gap = gapBetweenLanes(lo, hi);
+    const available = (laneWidth.get(lo) + gap + laneWidth.get(hi)) / 2;
     if (need > available) {
       const extra = (need - available) / 2 + 4;
       laneWidth.set(lo, laneWidth.get(lo) + extra);
       laneWidth.set(hi, laneWidth.get(hi) + extra);
     }
   }
-  // Cumulative center-x per lane, packed tightly with just COL_GAP between
-  // each lane's own edge and the next.
+  // Cumulative center-x per lane. Adjacent lanes belonging to the same
+  // parent couple (true full siblings) pack at the tighter COL_GAP_SIBLING;
+  // every other adjacency (a different family branch) keeps the wider
+  // COL_GAP — this is what visually clusters each nuclear family together
+  // instead of spacing every leaf evenly regardless of who's related to whom.
   const laneCenterX = new Map();
   let cursorX = MARGIN;
+  let lastGap = COL_GAP;
   for (let i = 0; i <= maxLane; i++) {
     const w = laneWidth.get(i);
     laneCenterX.set(i, cursorX + w / 2);
-    cursorX += w + COL_GAP;
+    lastGap = i < maxLane ? gapBetweenLanes(i, i + 1) : COL_GAP;
+    cursorX += w + lastGap;
   }
-  const rightEdge = maxLane >= 0 && laneCenterX.size ? cursorX - COL_GAP : MARGIN;
+  const rightEdge = maxLane >= 0 && laneCenterX.size ? cursorX - lastGap : MARGIN;
   // A unit's own column can be fractional (an ancestor centered between two
   // lanes) — interpolate linearly between its two neighboring lane centers,
   // matching how the original uniform-width layout always placed a unit at
@@ -3054,7 +3087,7 @@ function wireTree() {
   });
 
   document.getElementById('exportToggleBtn').addEventListener('click', () => document.getElementById('exportPanel').classList.toggle('hidden'));
-  document.getElementById('startExportBtn').addEventListener('click', doExport);
+  document.getElementById('startExportBtn').addEventListener('click', () => doExport(treeState, '家系圖'));
 }
 
 // Browsers refuse to actually rasterize a canvas past roughly 268,435,456px²
@@ -3067,13 +3100,18 @@ function wireTree() {
 // their own math from the canvas's *actual* width/height — adapts
 // automatically with no separate change needed.
 const MAX_CANVAS_AREA = 230000000;
-async function rasterizeSVG(bgWhite, resMult) {
-  const clone = treeState.svgEl.cloneNode(true);
+// st defaults to treeState (the pedigree tree view) so every pre-existing
+// caller/test that invokes rasterizeSVG(bgWhite, resMult) with no third
+// argument keeps working unchanged. The relation-graph view (relationState)
+// passes itself explicitly instead.
+async function rasterizeSVG(bgWhite, resMult, st) {
+  st = st || treeState;
+  const clone = st.svgEl.cloneNode(true);
   clone.querySelector('#svgBgRect').setAttribute('fill', bgWhite ? '#ffffff' : 'none');
   const xml = new XMLSerializer().serializeToString(clone);
   const svgBlob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' });
   const url = URL.createObjectURL(svgBlob);
-  const w = treeState.layout.width, h = treeState.layout.height;
+  const w = st.layout.width, h = st.layout.height;
   let effMult = resMult;
   if (w * h * effMult * effMult > MAX_CANVAS_AREA) {
     effMult = Math.max(0.05, Math.sqrt(MAX_CANVAS_AREA / (w * h)));
@@ -3088,37 +3126,42 @@ async function rasterizeSVG(bgWhite, resMult) {
   canvas.__resolutionClamped = effMult < resMult;
   return canvas;
 }
-async function doExport() {
+// st/labelSuffix default to the pedigree tree view so doExport() with no
+// arguments (every existing caller/test) behaves exactly as before. The
+// relation-graph view calls doExport(relationState, '關係圖') instead.
+async function doExport(st, labelSuffix) {
+  st = st || treeState;
+  labelSuffix = labelSuffix || '家系圖';
   const statusEl = document.getElementById('exportStatus');
   const bgWhite = document.querySelector('input[name=bg]:checked').value === 'white';
   const resMult = Number(document.getElementById('resSelect').value);
-  const famName = (familyById(treeState.familyId) || {}).name || 'family';
+  const famName = (familyById(st.familyId) || {}).name || 'family';
   let anyOk = false, anyAttempted = false, resolutionClamped = false;
 
   try {
     if (document.getElementById('fmtSvg').checked) {
       anyAttempted = true;
       statusEl.textContent = '正在準備 SVG…';
-      const clone = treeState.svgEl.cloneNode(true);
+      const clone = st.svgEl.cloneNode(true);
       clone.querySelector('#svgBgRect').setAttribute('fill', bgWhite ? '#ffffff' : 'none');
       const xml = '<?xml version="1.0" standalone="no"?>\r\n' + new XMLSerializer().serializeToString(clone);
-      if (await claudeSave(`${famName}_家系圖.svg`, new Blob([xml], { type: 'image/svg+xml' }))) anyOk = true;
+      if (await claudeSave(`${famName}_${labelSuffix}.svg`, new Blob([xml], { type: 'image/svg+xml' }))) anyOk = true;
     }
     if (document.getElementById('fmtPng').checked || document.getElementById('fmtJpg').checked || document.getElementById('fmtPdf').checked) {
       statusEl.textContent = '正在繪製圖像…';
-      const canvas = await rasterizeSVG(bgWhite, resMult);
+      const canvas = await rasterizeSVG(bgWhite, resMult, st);
       if (canvas.__resolutionClamped) resolutionClamped = true;
       if (document.getElementById('fmtPng').checked) {
         anyAttempted = true;
         statusEl.textContent = '正在準備 PNG…';
         const blob = await new Promise(res => canvas.toBlob(res, 'image/png'));
-        if (await claudeSave(`${famName}_家系圖.png`, blob)) anyOk = true;
+        if (await claudeSave(`${famName}_${labelSuffix}.png`, blob)) anyOk = true;
       }
       if (document.getElementById('fmtJpg').checked) {
         anyAttempted = true;
         statusEl.textContent = '正在準備 JPG…';
         const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.92));
-        if (await claudeSave(`${famName}_家系圖.jpg`, blob)) anyOk = true;
+        if (await claudeSave(`${famName}_${labelSuffix}.jpg`, blob)) anyOk = true;
       }
       if (document.getElementById('fmtPdf').checked) {
         anyAttempted = true;
@@ -3135,7 +3178,7 @@ async function doExport() {
           const w = canvas.width * ratio, h = canvas.height * ratio;
           pdf.addImage(imgData, 'JPEG', (pageW - w) / 2, (pageH - h) / 2, w, h);
         } else {
-          const scalePxPerMm = canvas.width / treeState.layout.width;
+          const scalePxPerMm = canvas.width / st.layout.width;
           const tileWpx = pageW * scalePxPerMm, tileHpx = pageH * scalePxPerMm;
           const cols = Math.ceil(canvas.width / tileWpx), rows = Math.ceil(canvas.height / tileHpx);
           let first = true;
@@ -3154,7 +3197,7 @@ async function doExport() {
             }
           }
         }
-        if (await claudeSave(`${famName}_家系圖.pdf`, pdf.output('blob'))) anyOk = true;
+        if (await claudeSave(`${famName}_${labelSuffix}.pdf`, pdf.output('blob'))) anyOk = true;
       }
     }
     if (!anyAttempted) { statusEl.textContent = '請至少勾選一種輸出格式。'; return; }
@@ -3216,62 +3259,263 @@ function buildRelationTree(familyId) {
   return { topNodes, linkedCount: linkedNames.size, stats: familyStats(familyId) };
 }
 
-function relationPersonHTML(m) {
-  return `
-    <div class="rg-person">
-      <div class="rg-p-name">${escapeHtml(m.chinese_name || m.tribal_name || '未命名')}${m.is_heir ? ' <span style="color:var(--heir-ink);font-size:11px;">(長嗣)</span>' : ''}</div>
-      <div class="rg-p-tribal">${escapeHtml(m.tribal_name && m.chinese_name ? m.tribal_name : (m.origin_family_name || ''))}</div>
-    </div>`;
+/** Turns buildRelationTree's nested node structure into concrete pixel
+ *  geometry, the same "leaves get sequential slots, parents average their
+ *  children" method buildTreeLayout uses for the pedigree tree — so this
+ *  view can share its pan/zoom + PDF/PNG/JPG/SVG export machinery instead of
+ *  needing its own. Every box (root card, couple-mini card, linked-family
+ *  card) becomes a plain SVG rect+text group; every connector becomes a
+ *  simple down/bus/down line trio, matching the pedigree tree's style. */
+function buildRelationLayout(familyId) {
+  const f = familyById(familyId);
+  const rt = buildRelationTree(familyId);
+  const ROOT_W = 300, ROOT_H = 150;
+  const COUPLE_W = 280, COUPLE_H = 84;
+  const FAM_W = 220, FAM_H = 104;
+  const SLOT_W = 280, GAP_X = 40;
+  const ROW_H = 270, MARGIN = 70;
+  const firstRowY = MARGIN + ROOT_H + 60;
+
+  const nodes = []; const edges = [];
+  let cursor = 0;
+
+  function layout(n, depth) {
+    let centerX;
+    if (!n.children.length) {
+      centerX = MARGIN + cursor * (SLOT_W + GAP_X) + SLOT_W / 2;
+      cursor++;
+    } else {
+      const childCenters = n.children.map(c => layout(c, depth + 1));
+      centerX = (Math.min(...childCenters) + Math.max(...childCenters)) / 2;
+    }
+    const y = firstRowY + depth * ROW_H;
+    nodes.push({ type: 'couple', x: centerX - COUPLE_W / 2, y, w: COUPLE_W, h: COUPLE_H, members: n.unit.members });
+    let bottomY = y + COUPLE_H;
+    if (n.linked) {
+      const linkY = bottomY + 26;
+      edges.push({ x1: centerX, y1: bottomY, x2: centerX, y2: linkY });
+      nodes.push({ type: 'family', x: centerX - FAM_W / 2, y: linkY, w: FAM_W, h: FAM_H, linked: n.linked });
+      bottomY = linkY + FAM_H;
+    }
+    if (n.children.length) {
+      const childCenters = n.children.map(c => c.__cx);
+      const busY = bottomY + 30;
+      const childTopY = firstRowY + (depth + 1) * ROW_H;
+      edges.push({ x1: centerX, y1: bottomY, x2: centerX, y2: busY });
+      edges.push({ x1: Math.min(...childCenters), y1: busY, x2: Math.max(...childCenters), y2: busY });
+      for (const cx of childCenters) edges.push({ x1: cx, y1: busY, x2: cx, y2: childTopY });
+    }
+    n.__cx = centerX;
+    return centerX;
+  }
+  const topCenters = rt.topNodes.map(n => layout(n, 0));
+
+  const rootBox = { type: 'root', x: MARGIN, y: MARGIN, w: ROOT_W, h: ROOT_H, name: f ? f.name : '', stats: rt.stats, linkedCount: rt.linkedCount };
+  if (topCenters.length) {
+    const rootCX = (Math.min(...topCenters) + Math.max(...topCenters)) / 2;
+    rootBox.x = rootCX - ROOT_W / 2;
+    const rootBottomY = MARGIN + ROOT_H, busY = rootBottomY + 30;
+    edges.push({ x1: rootCX, y1: rootBottomY, x2: rootCX, y2: busY });
+    edges.push({ x1: Math.min(...topCenters), y1: busY, x2: Math.max(...topCenters), y2: busY });
+    for (const cx of topCenters) edges.push({ x1: cx, y1: busY, x2: cx, y2: firstRowY });
+  }
+  nodes.unshift(rootBox);
+
+  const maxX = nodes.reduce((mx, b) => Math.max(mx, b.x + b.w), 0);
+  const maxY = nodes.reduce((my, b) => Math.max(my, b.y + b.h), 0);
+  return { nodes, edges, width: Math.max(maxX + MARGIN, 800), height: Math.max(maxY + MARGIN, 500), linkedCount: rt.linkedCount };
 }
-function relationNodeHTML(n) {
-  const linked = n.linked;
+
+function relationNodeSVG(b) {
+  if (b.type === 'root') {
+    const lines = [
+      `人數：${b.stats.total}人`, `男性：${b.stats.maleAlive}人`,
+      `女性：${b.stats.femaleAlive}人`, `關聯家族數：${b.linkedCount}`,
+    ];
+    return `
+      <g class="rel-box rel-root" transform="translate(${b.x},${b.y})">
+        <rect width="${b.w}" height="${b.h}" rx="16" fill="#fbe1e2" stroke="#a83a28" stroke-width="3"/>
+        <text class="fit-text" data-maxw="${b.w - 24}" x="${b.w / 2}" y="34" text-anchor="middle" font-size="21" font-weight="800" fill="#5a2318">${escapeHtml(b.name)}家族</text>
+        ${lines.map((t, i) => `<text x="20" y="${60 + i * 24}" font-size="14.5" fill="#6b4a2c">${escapeHtml(t)}</text>`).join('')}
+      </g>`;
+  }
+  if (b.type === 'family') {
+    const lk = b.linked;
+    return `
+      <g class="rel-box rel-family" transform="translate(${b.x},${b.y})">
+        <rect width="${b.w}" height="${b.h}" rx="12" fill="#f7e4bd" stroke="#c9971f" stroke-width="2.5"/>
+        <text class="fit-text" data-maxw="${b.w - 20}" x="${b.w / 2}" y="28" text-anchor="middle" font-size="16" font-weight="800" fill="#5a4212">${escapeHtml(lk.name)}</text>
+        <text x="16" y="52" font-size="13" fill="#6b4a2c">人數：${lk.total}人</text>
+        <text x="16" y="73" font-size="13" fill="#6b4a2c">男性：${lk.male}人</text>
+        <text x="16" y="94" font-size="13" fill="#6b4a2c">女性：${lk.female}人</text>
+      </g>`;
+  }
+  const members = b.members;
+  const halfW = b.w / members.length;
+  const maxW = halfW - 16;
+  const divider = members.length > 1 ? `<line x1="${halfW}" y1="10" x2="${halfW}" y2="${b.h - 10}" stroke="#9fb6d6" stroke-width="1.5"/>` : '';
+  const persons = members.map((m, i) => {
+    const cx = i * halfW + halfW / 2;
+    const name = m.chinese_name || m.tribal_name || '未命名';
+    const sub = (m.tribal_name && m.chinese_name) ? m.tribal_name : (m.origin_family_name || '');
+    return `
+      <text class="fit-text" data-maxw="${maxW}" x="${cx}" y="32" text-anchor="middle" font-size="15.5" font-weight="800" fill="#2c4a70">${escapeHtml(name)}${m.is_heir ? '<tspan fill="#7a530c" font-size="11.5">（長嗣）</tspan>' : ''}</text>
+      ${sub ? `<text class="fit-text" data-maxw="${maxW}" x="${cx}" y="53" text-anchor="middle" font-size="12" fill="#5a6a80">${escapeHtml(sub)}</text>` : ''}`;
+  }).join('');
   return `
-    <li>
-      <div class="rg-node">
-        <div class="rg-couple-mini">${n.unit.members.map(relationPersonHTML).join('')}</div>
-        ${linked ? `
-          <div class="rg-link-down"></div>
-          <div class="rg-box family">
-            <div class="rg-stat"><strong>${escapeHtml(linked.name)}</strong></div>
-            <div class="rg-stat">人數：${linked.total}人</div>
-            <div class="rg-stat">男性：${linked.male}人</div>
-            <div class="rg-stat">女性：${linked.female}人</div>
-          </div>` : ''}
-      </div>
-      ${n.children.length ? `<ul>${n.children.map(relationNodeHTML).join('')}</ul>` : ''}
-    </li>`;
+    <g class="rel-box rel-couple" transform="translate(${b.x},${b.y})">
+      <rect width="${b.w}" height="${b.h}" rx="12" fill="#e7effa" stroke="#5f84b8" stroke-width="2.5"/>
+      ${divider}${persons}
+    </g>`;
+}
+
+/** Mirrors treeState/renderTreeSVG/applyTreeTransform for the relation-graph
+ *  view — kept as its own parallel state object (not merged into treeState)
+ *  so the two views never fight over the same layout/svgEl, and so nothing
+ *  about the pedigree tree's already-tested behavior changes. */
+let relationState = { scale: 1, panX: 40, panY: 20, layout: null, svgEl: null, familyId: null };
+
+function renderRelationSVG() {
+  const familyId = relationState.familyId;
+  const layout = buildRelationLayout(familyId);
+  relationState.layout = layout;
+  const lines = layout.edges.map(e => `<line x1="${e.x1}" y1="${e.y1}" x2="${e.x2}" y2="${e.y2}" stroke="#8a7a5e" stroke-width="2.5"/>`).join('');
+  const svgStr = `<svg id="relationSvg" xmlns="http://www.w3.org/2000/svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}">
+    <rect id="svgBgRect" x="0" y="0" width="${layout.width}" height="${layout.height}" fill="#ffffff"/>
+    <g id="relEdgesLayer">${lines}</g>
+    <g id="relBoxesLayer">${layout.nodes.map(relationNodeSVG).join('')}</g>
+  </svg>`;
+  const canvas = document.getElementById('canvas');
+  canvas.innerHTML = svgStr;
+  relationState.svgEl = document.getElementById('relationSvg');
+  fitNodeText(relationState.svgEl);
+  applyRelationTransform();
+}
+
+function applyRelationTransform() {
+  const canvas = document.getElementById('canvas');
+  if (!canvas) return;
+  canvas.style.transform = `translate(${relationState.panX}px, ${relationState.panY}px) scale(${relationState.scale})`;
+  const zr = document.getElementById('zoomReadout');
+  if (zr) zr.textContent = `縮放 ${Math.round(relationState.scale * 100)}%`;
 }
 
 function viewRelation() {
   const familyId = state.params.familyId;
   const f = familyById(familyId);
-  const rt = buildRelationTree(familyId);
   return `
     ${familyNav('relation', familyId)}
-    <div class="panel">
-      <div class="stat-chips" style="margin-bottom:6px;">
-        <span class="stat-chip">${escapeHtml(f ? f.name : '')}家族 共連結 ${rt.linkedCount} 個家族</span>
+    <div class="tree-toolbar">
+      <span class="stat-chips"><span class="stat-chip">${escapeHtml(f ? f.name : '')}家族關係圖 — 左鍵拖拉可平移，滾輪可縮放</span></span>
+      <span style="flex:1;"></span>
+      <button class="btn sm" id="resetBtn">重置</button>
+      <button class="btn sm" id="exportToggleBtn">輸出</button>
+      ${state.params.public ? '' : '<button class="btn sm" id="toAdminBtn">後台管理</button>'}
+      <span class="zoom-readout" id="zoomReadout">縮放 100%</span>
+    </div>
+    <div class="panel hidden" id="exportPanel">
+      <h4 style="margin:0 0 12px; font-family:var(--font-display);">關係圖輸出</h4>
+      <div class="export-panel">
+        <div>
+          <h4>輸出格式</h4>
+          <label class="opt"><input type="checkbox" id="fmtPdf" checked> PDF</label>
+          <label class="opt"><input type="checkbox" id="fmtPng"> PNG</label>
+          <label class="opt"><input type="checkbox" id="fmtJpg"> JPG</label>
+          <label class="opt"><input type="checkbox" id="fmtSvg"> 向量 SVG</label>
+        </div>
+        <div>
+          <h4>列印模式</h4>
+          <label class="opt"><input type="radio" name="printMode" value="fit" checked> 單頁縮放</label>
+          <label class="opt"><input type="radio" name="printMode" value="split"> PDF 分割列印</label>
+          <h4 style="margin-top:10px;">方向</h4>
+          <label class="opt"><input type="radio" name="orient" value="landscape" checked> 橫式</label>
+          <label class="opt"><input type="radio" name="orient" value="portrait"> 直式</label>
+        </div>
+        <div>
+          <h4>紙張尺寸</h4>
+          <label class="opt"><input type="radio" name="paper" value="a4" checked> A4</label>
+          <label class="opt"><input type="radio" name="paper" value="a3"> A3</label>
+          <h4 style="margin-top:10px;">輸出背景</h4>
+          <label class="opt"><input type="radio" name="bg" value="white" checked> 白色背景</label>
+          <label class="opt"><input type="radio" name="bg" value="transparent"> 透明背景</label>
+        </div>
+        <div>
+          <h4>解析度</h4>
+          <select id="resSelect"><option value="2">300PX（標準）</option><option value="3">450PX（高解析）</option><option value="1">150PX（快速預覽）</option></select>
+          <button class="btn primary" id="startExportBtn" style="margin-top:14px;">開始輸出</button>
+          <p class="small muted" id="exportStatus" style="margin-top:8px;"></p>
+        </div>
       </div>
-      <div class="rg-scroll">
-        <ul class="rg-tree">
-          <li>
-            <div class="rg-node">
-              <div class="rg-box root">
-                <h3>${escapeHtml(f ? f.name : '')}</h3>
-                <div class="rg-stat">人數：${rt.stats.total}人</div>
-                <div class="rg-stat">男性：${rt.stats.maleAlive}人</div>
-                <div class="rg-stat">女性：${rt.stats.femaleAlive}人</div>
-                <div class="rg-stat">關聯家族數：${rt.linkedCount}</div>
-              </div>
-            </div>
-            ${rt.topNodes.length ? `<ul>${rt.topNodes.map(relationNodeHTML).join('')}</ul>` : '<p class="muted small" style="margin-top:14px;">尚無跨家族聯姻資料可顯示。</p>'}
-          </li>
-        </ul>
-      </div>
-    </div>`;
+    </div>
+    <div class="tree-viewport" id="viewport"><div class="tree-canvas" id="canvas"></div></div>`;
 }
+
 function wireRelation() {
-  wireCommonNav(document.getElementById('app'));
+  relationState.familyId = state.params.familyId;
+  relationState.scale = 1; relationState.panX = 40; relationState.panY = 20;
+  familyNavWire();
+  renderRelationSVG();
+
+  const vp = document.getElementById('viewport');
+  let dragging = false, lastX = 0, lastY = 0;
+  vp.addEventListener('mousedown', (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; vp.classList.add('grabbing'); });
+  window.addEventListener('mousemove', onRelMouseMove);
+  window.addEventListener('mouseup', onRelMouseUp);
+  function onRelMouseMove(e) {
+    if (!dragging) return;
+    relationState.panX += e.clientX - lastX; relationState.panY += e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    applyRelationTransform();
+  }
+  function onRelMouseUp() { dragging = false; vp.classList.remove('grabbing'); }
+  vp.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = vp.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const contentX = (mx - relationState.panX) / relationState.scale, contentY = (my - relationState.panY) / relationState.scale;
+    const newScale = Math.min(2.5, Math.max(0.15, relationState.scale * (e.deltaY < 0 ? 1.1 : 0.9)));
+    relationState.panX = mx - contentX * newScale; relationState.panY = my - contentY * newScale; relationState.scale = newScale;
+    applyRelationTransform();
+  }, { passive: false });
+
+  // Touch support mirrors wireTree's: one finger pans, two fingers pinch-zoom.
+  let touchMode = null;
+  let touchLastX = 0, touchLastY = 0;
+  let pinchStartDist = 0, pinchStartScale = 1;
+  function touchPoint(e, i) { const rect = vp.getBoundingClientRect(); return { x: e.touches[i].clientX - rect.left, y: e.touches[i].clientY - rect.top }; }
+  function touchDist(e) { const a = touchPoint(e, 0), b = touchPoint(e, 1); return Math.hypot(a.x - b.x, a.y - b.y); }
+  function touchMid(e) { const a = touchPoint(e, 0), b = touchPoint(e, 1); return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
+  vp.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 1) { touchMode = 'pan'; touchLastX = e.touches[0].clientX; touchLastY = e.touches[0].clientY; }
+    else if (e.touches.length >= 2) { touchMode = 'pinch'; pinchStartDist = touchDist(e) || 1; pinchStartScale = relationState.scale; }
+  }, { passive: true });
+  vp.addEventListener('touchmove', (e) => {
+    if (touchMode === 'pan' && e.touches.length === 1) {
+      e.preventDefault();
+      relationState.panX += e.touches[0].clientX - touchLastX;
+      relationState.panY += e.touches[0].clientY - touchLastY;
+      touchLastX = e.touches[0].clientX; touchLastY = e.touches[0].clientY;
+      applyRelationTransform();
+    } else if (touchMode === 'pinch' && e.touches.length >= 2) {
+      e.preventDefault();
+      const mid = touchMid(e);
+      const contentX = (mid.x - relationState.panX) / relationState.scale, contentY = (mid.y - relationState.panY) / relationState.scale;
+      const newScale = Math.min(2.5, Math.max(0.15, pinchStartScale * (touchDist(e) / pinchStartDist)));
+      relationState.panX = mid.x - contentX * newScale; relationState.panY = mid.y - contentY * newScale; relationState.scale = newScale;
+      applyRelationTransform();
+    }
+  }, { passive: false });
+  vp.addEventListener('touchend', (e) => { if (e.touches.length === 0) touchMode = null; else if (e.touches.length === 1) { touchMode = 'pan'; touchLastX = e.touches[0].clientX; touchLastY = e.touches[0].clientY; } });
+  vp.addEventListener('touchcancel', () => { touchMode = null; });
+
+  document.getElementById('resetBtn').addEventListener('click', () => {
+    relationState.scale = 1; relationState.panX = 40; relationState.panY = 20; applyRelationTransform();
+  });
+  const toAdminBtn = document.getElementById('toAdminBtn');
+  if (toAdminBtn) toAdminBtn.addEventListener('click', () => go('admin', { tab: 'mem', familyId: relationState.familyId }));
+
+  document.getElementById('exportToggleBtn').addEventListener('click', () => document.getElementById('exportPanel').classList.toggle('hidden'));
+  document.getElementById('startExportBtn').addEventListener('click', () => doExport(relationState, '關係圖'));
 }
 
 /* ================================================================ LIST VIEW */
