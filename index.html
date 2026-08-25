@@ -2070,7 +2070,18 @@ function wireMemberEdit() {
 // A married couple shares one outer frame (see unitFrameSVG): FRAME_PAD is the
 // padding between the frame border and each spouse's content column, and
 // COL_GAP_INNER is the gap between the two columns where the divider line sits.
-const NODE_W = 260, NODE_H = 404, FRAME_PAD = 20, COL_GAP_INNER = 24, COL_GAP = 60, ROW_H = 474, MARGIN = 70;
+// ROW_H must clear NODE_H by more than the marriage-connector "bus" line's
+// drop (46px below a frame's bottom, see buildTreeLayout's parentEdges loop)
+// plus the next row's generation-badge protrusion (20px above its frame) —
+// otherwise that horizontal bus line lands inside the next generation's
+// cards instead of the empty gap between rows. COL_GAP/COL_GAP_INNER (the
+// left-right spacing) were tightened for compaction; ROW_H/MARGIN (the
+// up-down spacing) intentionally were not — keep them at their original,
+// clearance-safe values.
+const NODE_W = 260, NODE_H = 404, FRAME_PAD = 20, COL_GAP_INNER = 24, COL_GAP = 40, ROW_H = 474, MARGIN = 70;
+// A spouse's name/tribal text renders in this blue, distinguishing anyone who
+// married into the family from the blood-line members around them (black).
+const SPOUSE_INK = '#1d5fa8';
 
 /** Group decorated members into "units" — a household frame containing one
  *  blood-line anchor plus every recorded spouse of theirs (one spouse for a
@@ -2097,14 +2108,24 @@ function buildUnits(members) {
     let memberList; let anchorIdx;
     if (availableSpouses.length) {
       const first = availableSpouses[0];
-      // The 當家長嗣 (heir) always sits on the left of the primary pair,
-      // regardless of gender — Paiwan household succession is not strictly
-      // patrilineal, so the spouse who married into the household (入婚/入贅)
-      // goes on the right. Only fall back to a male-first default when
-      // neither side is marked as heir. Any further spouses (2nd marriage,
-      // 3rd, ...) are appended after the primary pair in marriage order.
+      // The blood-line member of THIS family always sits on the left of the
+      // primary pair, and their spouse — whoever married in, regardless of
+      // gender — always sits on the right. Whether someone has a recorded
+      // father_id/mother_id is the signal for "born into this family's
+      // tracked lineage" versus "married in from outside": a spouse's own
+      // parents are essentially never entered in this tree, while a blood
+      // descendant's are (once past the founding generation). Only when
+      // neither side has a recorded parent — typically a family's own root
+      // ancestor pair, where structurally neither can be distinguished this
+      // way — do we fall back to the 當家長嗣 (heir) rule, and after that to
+      // a male-first default. Any further spouses (2nd marriage, 3rd, ...)
+      // are appended after the primary pair in marriage order.
+      const mHasParents = m.father_id != null || m.mother_id != null;
+      const pHasParents = first.partner.father_id != null || first.partner.mother_id != null;
       let primaryPair;
-      if (m.is_heir && !first.partner.is_heir) primaryPair = [m, first.partner];
+      if (mHasParents && !pHasParents) primaryPair = [m, first.partner];
+      else if (pHasParents && !mHasParents) primaryPair = [first.partner, m];
+      else if (m.is_heir && !first.partner.is_heir) primaryPair = [m, first.partner];
       else if (first.partner.is_heir && !m.is_heir) primaryPair = [first.partner, m];
       else primaryPair = m.gender === '男' ? [m, first.partner] : [first.partner, m];
       memberList = primaryPair.concat(availableSpouses.slice(1).map(x => x.partner));
@@ -2217,25 +2238,77 @@ function buildTreeLayout(members) {
   for (const u of units) if (!colOf.has(u.id)) assignColumns(u.id);
 
   const coupleUnitWidth = FRAME_PAD * 2 + NODE_W * 2 + COL_GAP_INNER;
-  const soloUnitWidth = FRAME_PAD * 2 + NODE_W;
-  // A remarried anchor's frame holds more than two boxes, so every column
-  // is sized to fit the widest frame anywhere in the tree — narrower
-  // columns just carry a little extra breathing room either side.
-  const maxMembersInAnyUnit = units.reduce((mx, u) => Math.max(mx, u.members.length), 1);
-  const widestUnitWidth = FRAME_PAD * 2 + NODE_W * maxMembersInAnyUnit + COL_GAP_INNER * Math.max(0, maxMembersInAnyUnit - 1);
-  const colWidth = Math.max(coupleUnitWidth, widestUnitWidth) + COL_GAP;
+  const unitWidthOf = (u) => FRAME_PAD * 2 + NODE_W * u.members.length + COL_GAP_INNER * Math.max(0, u.members.length - 1);
+
+  // Columns used to all share one uniform width sized to fit the single
+  // widest frame anywhere in the tree — so one remarried anchor (a 3+ box
+  // frame) anywhere in a large family bloated every column everywhere else,
+  // even branches nowhere near it, producing huge dead whitespace. Instead,
+  // each integer "lane" (colCursor slot) gets only as much width as the
+  // widest frame that actually lands on it, so a wide frame only pushes its
+  // own lane's neighbors apart.
+  const laneWidth = new Map();
+  for (const u of units) {
+    const col = colOf.get(u.id);
+    if (Number.isInteger(col)) {
+      const w = Math.max(coupleUnitWidth, unitWidthOf(u));
+      laneWidth.set(col, Math.max(laneWidth.get(col) || 0, w));
+    }
+  }
+  const maxLane = colCursor > 0 ? colCursor - 1 : 0;
+  for (let i = 0; i <= maxLane; i++) if (!laneWidth.has(i)) laneWidth.set(i, coupleUnitWidth);
+  // An ancestor unit centered between two lanes (its column is the average
+  // of its children's, e.g. 2.5) doesn't own a lane outright — widen its two
+  // neighboring lanes if needed so its own frame still has room to fit
+  // between them without overlapping either one.
+  for (const u of units) {
+    const col = colOf.get(u.id);
+    if (Number.isInteger(col)) continue;
+    const lo = Math.floor(col), hi = Math.ceil(col);
+    const need = unitWidthOf(u);
+    const available = (laneWidth.get(lo) + COL_GAP + laneWidth.get(hi)) / 2;
+    if (need > available) {
+      const extra = (need - available) / 2 + 4;
+      laneWidth.set(lo, laneWidth.get(lo) + extra);
+      laneWidth.set(hi, laneWidth.get(hi) + extra);
+    }
+  }
+  // Cumulative center-x per lane, packed tightly with just COL_GAP between
+  // each lane's own edge and the next.
+  const laneCenterX = new Map();
+  let cursorX = MARGIN;
+  for (let i = 0; i <= maxLane; i++) {
+    const w = laneWidth.get(i);
+    laneCenterX.set(i, cursorX + w / 2);
+    cursorX += w + COL_GAP;
+  }
+  const rightEdge = maxLane >= 0 && laneCenterX.size ? cursorX - COL_GAP : MARGIN;
+  // A unit's own column can be fractional (an ancestor centered between two
+  // lanes) — interpolate linearly between its two neighboring lane centers,
+  // matching how the original uniform-width layout always placed a unit at
+  // `col * colWidth` regardless of whether col was a whole number.
+  function xForCol(col) {
+    const lo = Math.floor(col), hi = Math.ceil(col);
+    if (lo === hi) return laneCenterX.get(lo);
+    const t = col - lo;
+    return laneCenterX.get(lo) + (laneCenterX.get(hi) - laneCenterX.get(lo)) * t;
+  }
+
   const nodes = []; const frames = []; const unitGeom = new Map();
   for (const unit of units) {
     const col = colOf.get(unit.id);
     const y = MARGIN + (unit.generation - 1) * ROW_H;
     const n = unit.members.length;
     const isCouple = n >= 2;
-    const unitWidth = FRAME_PAD * 2 + NODE_W * n + COL_GAP_INNER * Math.max(0, n - 1);
-    const unitLeft = MARGIN + col * colWidth - unitWidth / 2 + colWidth / 2;
+    const unitWidth = unitWidthOf(unit);
+    const unitLeft = xForCol(col) - unitWidth / 2;
     const boxCenterX = idx => unitLeft + FRAME_PAD + idx * (NODE_W + COL_GAP_INNER) + NODE_W / 2;
     unit.members.forEach((mem, idx) => {
       const x = unitLeft + FRAME_PAD + idx * (NODE_W + COL_GAP_INNER);
-      nodes.push({ member: mem, x, y, w: NODE_W, h: NODE_H, unitId: unit.id });
+      // idx 0 is always the family's own blood-line member (see buildUnits'
+      // primaryPair ordering) — every other position is a spouse, who
+      // married in, rendered in blue regardless of gender or marriage order.
+      nodes.push({ member: mem, x, y, w: NODE_W, h: NODE_H, unitId: unit.id, isSpouse: n > 1 && idx > 0 });
     });
     frames.push({ x: unitLeft, y, width: unitWidth, height: NODE_H, generation: unit.generation, isCouple, pairs: unit.pairs, boxCenterX });
     // For a normal solo member or single marriage, the ancestor-facing
@@ -2273,9 +2346,8 @@ function buildTreeLayout(members) {
       });
     }
   }
-  const maxCol = colCursor > 0 ? colCursor - 1 : 0;
   const maxGen = units.reduce((mx, u) => Math.max(mx, u.generation), 1);
-  const width = MARGIN * 2 + (maxCol + 1) * colWidth;
+  const width = rightEdge + MARGIN;
   const height = MARGIN * 2 + maxGen * ROW_H;
   return { nodes, frames, parentEdges, width: Math.max(width, 800), height: Math.max(height, 500) };
 }
@@ -2358,14 +2430,18 @@ function nodeSVG(n) {
   const hasTribal = !!(m.tribal_name && m.chinese_name);
   const originText = m.family_home_name || m.origin_family_name || '';
   // Stacked text lines below the photo. 中文名字 (chinese_name) leads at 38px,
-  // black/900 — the clear visual anchor of the card. 當家長嗣／族名／家名 all
+  // black/900 for a blood-line member — the clear visual anchor of the card
+  // — or blue for a spouse (n.isSpouse), so anyone who married into the
+  // family reads at a glance regardless of gender. 當家長嗣／族名／家名 all
   // share the same bold 28px weight below it — 當家長嗣 keeps its original
-  // warm dark-brown (#7a530c), while 族名／家名 are black (the same ink as
-  // the name line). （已故）always renders as its own final line at the
-  // bottom, after every other line that applies, rather than being tacked
-  // onto whichever line happened to be last.
+  // warm dark-brown (#7a530c) even for a spouse who became household head;
+  // 族名／家名 follow the name line's ink (black or blue). （已故）always
+  // renders as its own final line at the bottom, after every other line
+  // that applies, rather than being tacked onto whichever line happened to
+  // be last.
+  const nameInk = n.isSpouse ? SPOUSE_INK : '#2c2417';
   const heirAttrs = 'font-size="28" font-weight="700" fill="#7a530c"';
-  const blackAttrs = 'font-size="28" font-weight="700" fill="#2c2417"';
+  const blackAttrs = `font-size="28" font-weight="700" fill="${nameInk}"`;
   const subLines = [];
   if (m.is_heir) subLines.push({ text: '當家長嗣', attrs: heirAttrs });
   if (hasTribal) subLines.push({ text: m.tribal_name, attrs: blackAttrs });
@@ -2391,7 +2467,7 @@ function nodeSVG(n) {
       <rect x="${photoX}" y="16" width="${photoSide}" height="${photoSide}" rx="8" fill="#efe0c4"/>
       ${m.photo_data ? `<image href="${m.photo_data}" x="${photoX}" y="16" width="${photoSide}" height="${photoSide}" preserveAspectRatio="xMidYMid slice"/>` : `<text x="${n.w / 2}" y="${16 + photoSide / 2 + 5}" text-anchor="middle" font-size="13" fill="#8a7a5e">無照片</text>`}
       <rect x="${photoX}" y="16" width="${photoSide}" height="${photoSide}" rx="8" fill="none" stroke="#a8895c" stroke-width="2.5"/>
-      <text class="fit-text" data-maxw="${maxW}" x="${n.w / 2}" y="${nameY}" text-anchor="middle" font-size="38" font-weight="900" fill="#2c2417">${escapeHtml(name)}</text>
+      <text class="fit-text" data-maxw="${maxW}" x="${n.w / 2}" y="${nameY}" text-anchor="middle" font-size="38" font-weight="900" fill="${nameInk}">${escapeHtml(name)}</text>
       ${subLineSVG}
     </g>`;
 }
@@ -2650,6 +2726,16 @@ function wireTree() {
   document.getElementById('startExportBtn').addEventListener('click', doExport);
 }
 
+// Browsers refuse to actually rasterize a canvas past roughly 268,435,456px²
+// (16384×16384 in Chrome) — canvas.toDataURL() on an oversized canvas
+// doesn't throw, it silently returns an essentially-empty "data:," string,
+// which is why a large family's export could previously report success
+// while producing a blank/corrupt PDF or image with no error at all. Cap
+// the actual rasterized pixel size to a safe budget here (scaling the
+// requested resolution down as needed) so every caller — which all derive
+// their own math from the canvas's *actual* width/height — adapts
+// automatically with no separate change needed.
+const MAX_CANVAS_AREA = 230000000;
 async function rasterizeSVG(bgWhite, resMult) {
   const clone = treeState.svgEl.cloneNode(true);
   clone.querySelector('#svgBgRect').setAttribute('fill', bgWhite ? '#ffffff' : 'none');
@@ -2657,13 +2743,18 @@ async function rasterizeSVG(bgWhite, resMult) {
   const svgBlob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' });
   const url = URL.createObjectURL(svgBlob);
   const w = treeState.layout.width, h = treeState.layout.height;
+  let effMult = resMult;
+  if (w * h * effMult * effMult > MAX_CANVAS_AREA) {
+    effMult = Math.max(0.05, Math.sqrt(MAX_CANVAS_AREA / (w * h)));
+  }
   const img = await new Promise((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = reject; image.src = url; });
   const canvas = document.createElement('canvas');
-  canvas.width = w * resMult; canvas.height = h * resMult;
+  canvas.width = Math.max(1, Math.round(w * effMult)); canvas.height = Math.max(1, Math.round(h * effMult));
   const ctx = canvas.getContext('2d');
   if (bgWhite) { ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height); }
   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
   URL.revokeObjectURL(url);
+  canvas.__resolutionClamped = effMult < resMult;
   return canvas;
 }
 async function doExport() {
@@ -2671,7 +2762,7 @@ async function doExport() {
   const bgWhite = document.querySelector('input[name=bg]:checked').value === 'white';
   const resMult = Number(document.getElementById('resSelect').value);
   const famName = (familyById(treeState.familyId) || {}).name || 'family';
-  let anyOk = false, anyAttempted = false;
+  let anyOk = false, anyAttempted = false, resolutionClamped = false;
 
   try {
     if (document.getElementById('fmtSvg').checked) {
@@ -2685,6 +2776,7 @@ async function doExport() {
     if (document.getElementById('fmtPng').checked || document.getElementById('fmtJpg').checked || document.getElementById('fmtPdf').checked) {
       statusEl.textContent = '正在繪製圖像…';
       const canvas = await rasterizeSVG(bgWhite, resMult);
+      if (canvas.__resolutionClamped) resolutionClamped = true;
       if (document.getElementById('fmtPng').checked) {
         anyAttempted = true;
         statusEl.textContent = '正在準備 PNG…';
@@ -2735,7 +2827,8 @@ async function doExport() {
       }
     }
     if (!anyAttempted) { statusEl.textContent = '請至少勾選一種輸出格式。'; return; }
-    statusEl.textContent = anyOk ? '輸出完成。' : '未儲存任何檔案。';
+    const clampNote = resolutionClamped ? '（家族成員較多，已自動降低解析度以避免產生空白檔案）' : '';
+    statusEl.textContent = (anyOk ? '輸出完成。' : '未儲存任何檔案。') + clampNote;
   } catch (err) {
     statusEl.textContent = '輸出失敗：' + err.message;
     toast('輸出失敗：' + err.message, true);
